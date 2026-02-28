@@ -18,8 +18,8 @@ const envSchema = z.object({
   SOLANA_NETWORK: z
     .enum(["mainnet-beta", "devnet", "localnet"])
     .default("devnet"),
-  SOLANA_RPC_URL: z.string().url().default("https://api.devnet.solana.com"),
-  SENTINEL_PROGRAM_ID: z.string().min(32).max(50),
+  SOLANA_RPC_URL: z.string().url().default("https://betsey-5efi0d-fast-devnet.helius-rpc.com"),
+  SENTINEL_PROGRAM_ID: z.string().min(32).max(50).default("EV3TKRVz7pTHpAqBTjP8jmwuvoRBRCpjmVSPHhcMnXqb"),
   JWT_SECRET: z
     .string()
     .min(32, "JWT_SECRET must be at least 32 characters"),

@@ -50,6 +50,9 @@ RUN npm rebuild better-sqlite3
 # Copy compiled JS from builder
 COPY --from=builder /app/dist ./dist
 
+# Copy Drizzle migration files (auto-migrate on startup)
+COPY drizzle/ ./drizzle/
+
 # Create data directory for SQLite persistent volume
 RUN mkdir -p /data && chown sage:sage /data
 
