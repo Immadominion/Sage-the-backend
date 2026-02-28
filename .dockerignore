@@ -1,0 +1,15 @@
+node_modules/
+dist/
+*.db
+*.db-journal
+*.db-wal
+.env
+.env.local
+.env.*.local
+*.log
+.git/
+.gitignore
+.vscode/
+*.md
+LICENSE
+drizzle.config.ts

@@ -1,0 +1,20 @@
+# ═══════════════════════════════════════════════════════════════
+# Railway deployment config for sage-backend
+#
+# Railway auto-detects the Dockerfile in this directory.
+# Persistent volume must be mounted at /data via Railway dashboard:
+#   Settings → Volumes → Add Volume → Mount Path: /data
+# ═══════════════════════════════════════════════════════════════
+
+[build]
+# Use the Dockerfile in this directory
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Health check endpoint — Railway pings this to verify deploy succeeded
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+
+# Graceful shutdown (SIGTERM → Phase 1-3 shutdown in index.ts)
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 3
