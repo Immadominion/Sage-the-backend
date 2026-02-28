@@ -1,4 +1,4 @@
-CREATE TABLE `bots` (
+CREATE TABLE IF NOT EXISTS `bots` (
 	`id` integer PRIMARY KEY AUTOINCREMENT NOT NULL,
 	`bot_id` text NOT NULL,
 	`user_id` integer NOT NULL,
@@ -31,8 +31,8 @@ CREATE TABLE `bots` (
 	FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON UPDATE no action ON DELETE no action
 );
 --> statement-breakpoint
-CREATE UNIQUE INDEX `bots_bot_id_unique` ON `bots` (`bot_id`);--> statement-breakpoint
-CREATE TABLE `positions` (
+CREATE UNIQUE INDEX IF NOT EXISTS `bots_bot_id_unique` ON `bots` (`bot_id`);--> statement-breakpoint
+CREATE TABLE IF NOT EXISTS `positions` (
 	`id` integer PRIMARY KEY AUTOINCREMENT NOT NULL,
 	`position_id` text NOT NULL,
 	`bot_id` text NOT NULL,
@@ -71,8 +71,8 @@ CREATE TABLE `positions` (
 	FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON UPDATE no action ON DELETE no action
 );
 --> statement-breakpoint
-CREATE UNIQUE INDEX `positions_position_id_unique` ON `positions` (`position_id`);--> statement-breakpoint
-CREATE TABLE `strategy_presets` (
+CREATE UNIQUE INDEX IF NOT EXISTS `positions_position_id_unique` ON `positions` (`position_id`);--> statement-breakpoint
+CREATE TABLE IF NOT EXISTS `strategy_presets` (
 	`id` integer PRIMARY KEY AUTOINCREMENT NOT NULL,
 	`user_id` integer,
 	`name` text NOT NULL,
@@ -92,7 +92,7 @@ CREATE TABLE `strategy_presets` (
 	FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON UPDATE no action ON DELETE no action
 );
 --> statement-breakpoint
-CREATE TABLE `trade_log` (
+CREATE TABLE IF NOT EXISTS `trade_log` (
 	`id` integer PRIMARY KEY AUTOINCREMENT NOT NULL,
 	`bot_id` text NOT NULL,
 	`user_id` integer NOT NULL,
@@ -104,7 +104,7 @@ CREATE TABLE `trade_log` (
 	FOREIGN KEY (`user_id`) REFERENCES `users`(`id`) ON UPDATE no action ON DELETE no action
 );
 --> statement-breakpoint
-CREATE TABLE `users` (
+CREATE TABLE IF NOT EXISTS `users` (
 	`id` integer PRIMARY KEY AUTOINCREMENT NOT NULL,
 	`wallet_address` text NOT NULL,
 	`sentinel_wallet_address` text,
@@ -116,4 +116,4 @@ CREATE TABLE `users` (
 	`updated_at` text DEFAULT (datetime('now')) NOT NULL
 );
 --> statement-breakpoint
-CREATE UNIQUE INDEX `users_wallet_address_unique` ON `users` (`wallet_address`);
+CREATE UNIQUE INDEX IF NOT EXISTS `users_wallet_address_unique` ON `users` (`wallet_address`);
