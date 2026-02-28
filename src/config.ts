@@ -27,7 +27,9 @@ const envSchema = z.object({
   JWT_ACCESS_TTL: z.string().default(process.env.NODE_ENV === "production" ? "15m" : "24h"),
   JWT_REFRESH_TTL: z.string().default(process.env.NODE_ENV === "production" ? "7d" : "30d"),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
-  DATABASE_URL: z.string().default("file:sage.db"),
+  DATABASE_URL: z.string().default(
+    process.env.NODE_ENV === "production" ? "file:/data/sage.db" : "file:sage.db"
+  ),
   CORS_ORIGINS: z.string().default("*"),
   HELIUS_API_KEY: z.string().optional(),
   METEORA_API_URL: z

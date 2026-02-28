@@ -40,9 +40,16 @@ const migrationsFolder = resolve(__dirname, "..", "..", "drizzle");
 
 try {
   migrate(db, { migrationsFolder });
-} catch (err) {
-  console.error("❌ Database migration failed:", err);
-  process.exit(1);
+  console.log("✅ Database migrations applied successfully");
+} catch (err: unknown) {
+  // If tables already exist (from db:push), that's fine — skip.
+  const msg = err instanceof Error ? err.message : String(err);
+  if (msg.includes("already exists")) {
+    console.log("ℹ️  Database tables already exist — skipping migration");
+  } else {
+    console.error("❌ Database migration failed:", err);
+    process.exit(1);
+  }
 }
 
 /** Close the underlying SQLite connection. Call during graceful shutdown. */
