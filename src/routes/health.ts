@@ -94,7 +94,9 @@ health.get("/", async (c) => {
     if (checks.status === "ok") checks.status = "degraded";
   }
 
-  const statusCode = checks.status === "ok" ? 200 : 503;
+  // Return 200 for "degraded" — Railway kills replicas on non-2xx health checks.
+  // Only return 503 if the server itself is truly broken (status === "down").
+  const statusCode = checks.status === "down" ? 503 : 200;
   return c.json(checks, statusCode as 200);
 });
 
