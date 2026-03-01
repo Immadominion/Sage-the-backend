@@ -34,7 +34,8 @@ const nonceSchema = z.object({
     .string()
     .min(32)
     .max(50)
-    .describe("Solana wallet address (base58)"),
+    .describe("Solana wallet address (base58)")
+    .optional(),
 });
 
 const verifySchema = z.object({
@@ -56,25 +57,35 @@ const refreshSchema = z.object({
 
 /**
  * POST /auth/nonce
- * Generate a nonce for the given wallet address.
- * The client uses this nonce to construct a SIWS message.
+ * Generate a nonce for SIWS authentication.
+ *
+ * Two modes:
+ *  - With `walletAddress`: legacy flow — nonce stored in user record,
+ *    full SIWS message returned.
+ *  - Without `walletAddress`: MWA-safe flow — nonce stored in memory,
+ *    client builds the SIWS message locally after getting the address
+ *    from wallet authorization.
  */
 auth.post("/nonce", zValidator("json", nonceSchema), async (c) => {
   const { walletAddress } = c.req.valid("json");
 
-  const nonce = await generateNonce(walletAddress);
+  const nonce = await generateNonce(walletAddress ?? null);
   const issuedAt = new Date().toISOString();
 
-  // Return the nonce AND the message the client should sign
-  const message = buildSIWSMessage(walletAddress, nonce, issuedAt);
-
-  return c.json({
+  // If walletAddress provided, return the full SIWS message (legacy flow).
+  // Otherwise, just return the nonce for client-side message construction.
+  const response: Record<string, unknown> = {
     success: true,
     nonce,
-    message,
     issuedAt,
     expiresInSeconds: 300,
-  });
+  };
+
+  if (walletAddress) {
+    response.message = buildSIWSMessage(walletAddress, nonce, issuedAt);
+  }
+
+  return c.json(response);
 });
 
 /**
@@ -92,11 +103,23 @@ auth.post("/verify", zValidator("json", verifySchema), async (c) => {
       message
     );
     const tokens = await issueTokens(userId, walletAddress);
+    const user = db
+      .select({
+        id: users.id,
+        walletAddress: users.walletAddress,
+        sentinelWalletAddress: users.sentinelWalletAddress,
+        displayName: users.displayName,
+        createdAt: users.createdAt,
+      })
+      .from(users)
+      .where(eq(users.id, userId))
+      .get();
 
     return c.json({
       success: true,
       ...tokens,
       walletAddress,
+      user,
     });
   } catch (err) {
     throw createApiError(

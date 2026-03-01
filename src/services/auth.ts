@@ -48,31 +48,62 @@ const JWT_SECRET = new TextEncoder().encode(config.JWT_SECRET);
 
 const NONCE_TTL_SECONDS = 300; // 5 minutes
 
-/** Generate a random nonce and store it for the given wallet address. */
-export async function generateNonce(walletAddress: string): Promise<string> {
+// ═══════════════════════════════════════════════════════════════
+// In-memory nonce store (for MWA / address-free flow)
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Standalone nonces not tied to a wallet address.
+ * Used when the mobile client fetches a nonce before knowing
+ * the wallet address (pre-MWA flow on Seeker).
+ */
+const standaloneNonces = new Map<string, number>(); // nonce → expiresAt
+
+/** Periodically clean expired standalone nonces (every 60s). */
+setInterval(() => {
+  const now = Math.floor(Date.now() / 1000);
+  for (const [nonce, expiresAt] of standaloneNonces) {
+    if (expiresAt < now) standaloneNonces.delete(nonce);
+  }
+}, 60_000);
+
+/**
+ * Generate a random nonce.
+ *
+ * - With `walletAddress`: legacy flow — nonce stored in the user's DB record.
+ * - Without `walletAddress`: MWA-safe flow — nonce stored in memory. The
+ *   client will build the SIWS message locally after getting the address
+ *   from wallet authorization.
+ */
+export async function generateNonce(walletAddress: string | null): Promise<string> {
   const nonce = crypto.randomBytes(16).toString("hex");
   const expiresAt = Math.floor(Date.now() / 1000) + NONCE_TTL_SECONDS;
 
-  // Upsert user with new nonce
-  const existing = db
-    .select()
-    .from(users)
-    .where(eq(users.walletAddress, walletAddress))
-    .get();
-
-  if (existing) {
-    db.update(users)
-      .set({ authNonce: nonce, authNonceExpiresAt: expiresAt })
+  if (walletAddress) {
+    // Legacy flow: store nonce in user record
+    const existing = db
+      .select()
+      .from(users)
       .where(eq(users.walletAddress, walletAddress))
-      .run();
+      .get();
+
+    if (existing) {
+      db.update(users)
+        .set({ authNonce: nonce, authNonceExpiresAt: expiresAt })
+        .where(eq(users.walletAddress, walletAddress))
+        .run();
+    } else {
+      db.insert(users)
+        .values({
+          walletAddress,
+          authNonce: nonce,
+          authNonceExpiresAt: expiresAt,
+        })
+        .run();
+    }
   } else {
-    db.insert(users)
-      .values({
-        walletAddress,
-        authNonce: nonce,
-        authNonceExpiresAt: expiresAt,
-      })
-      .run();
+    // MWA-safe flow: store nonce in memory
+    standaloneNonces.set(nonce, expiresAt);
   }
 
   return nonce;
@@ -108,6 +139,13 @@ export function buildSIWSMessage(
 /**
  * Verify an Ed25519 signature over a SIWS message.
  * Returns the user ID if valid, throws if invalid.
+ *
+ * Supports two nonce modes:
+ *  1. **Legacy (DB nonce)**: nonce was stored against the user's record
+ *     via `POST /auth/nonce` with `walletAddress`.
+ *  2. **MWA-safe (standalone nonce)**: nonce was stored in memory via
+ *     `POST /auth/nonce` without `walletAddress`. The client built the
+ *     SIWS message locally after getting the address from MWA.
  */
 export async function verifySIWSSignature(
   walletAddress: string,
@@ -130,36 +168,81 @@ export async function verifySIWSSignature(
     throw new Error("Invalid signature");
   }
 
-  // 3. Verify nonce (replay prevention)
-  const user = db
+  // 3. Extract nonce from message
+  const nonceMatch = message.match(/Nonce: (.+)/);
+  if (!nonceMatch) {
+    throw new Error("Message does not contain a nonce");
+  }
+  const messageNonce = nonceMatch[1].trim();
+
+  // 4. Verify nonce — check standalone store first, then user record
+  const now = Math.floor(Date.now() / 1000);
+
+  if (standaloneNonces.has(messageNonce)) {
+    // MWA-safe flow: nonce from in-memory store
+    const expiresAt = standaloneNonces.get(messageNonce)!;
+    if (expiresAt < now) {
+      standaloneNonces.delete(messageNonce);
+      throw new Error("Nonce expired");
+    }
+    // Invalidate (single-use)
+    standaloneNonces.delete(messageNonce);
+  } else {
+    // Legacy flow: nonce from user's DB record
+    const user = db
+      .select()
+      .from(users)
+      .where(eq(users.walletAddress, walletAddress))
+      .get();
+
+    if (!user || !user.authNonce) {
+      throw new Error("No pending nonce for this wallet");
+    }
+
+    if (user.authNonce !== messageNonce) {
+      throw new Error("Nonce mismatch");
+    }
+
+    if (user.authNonceExpiresAt && user.authNonceExpiresAt < now) {
+      throw new Error("Nonce expired");
+    }
+
+    // Invalidate (single-use)
+    db.update(users)
+      .set({ authNonce: null, authNonceExpiresAt: null })
+      .where(eq(users.walletAddress, walletAddress))
+      .run();
+  }
+
+  // 5. Also validate the Issued At timestamp isn't too old (belt + suspenders)
+  const issuedAtMatch = message.match(/Issued At: (.+)/);
+  if (issuedAtMatch) {
+    const issuedAt = new Date(issuedAtMatch[1].trim());
+    const ageSeconds = (Date.now() - issuedAt.getTime()) / 1000;
+    if (ageSeconds > NONCE_TTL_SECONDS) {
+      throw new Error("Message too old (issued at check)");
+    }
+  }
+
+  // 6. Upsert user (create if first sign-in)
+  let user = db
     .select()
     .from(users)
     .where(eq(users.walletAddress, walletAddress))
     .get();
 
-  if (!user || !user.authNonce) {
-    throw new Error("No pending nonce for this wallet");
+  if (!user) {
+    db.insert(users)
+      .values({ walletAddress })
+      .run();
+    user = db
+      .select()
+      .from(users)
+      .where(eq(users.walletAddress, walletAddress))
+      .get();
   }
 
-  // Extract nonce from message
-  const nonceMatch = message.match(/Nonce: (.+)/);
-  if (!nonceMatch || nonceMatch[1] !== user.authNonce) {
-    throw new Error("Nonce mismatch");
-  }
-
-  // Check nonce expiry
-  const now = Math.floor(Date.now() / 1000);
-  if (user.authNonceExpiresAt && user.authNonceExpiresAt < now) {
-    throw new Error("Nonce expired");
-  }
-
-  // 4. Invalidate nonce (single-use)
-  db.update(users)
-    .set({ authNonce: null, authNonceExpiresAt: null })
-    .where(eq(users.walletAddress, walletAddress))
-    .run();
-
-  return { userId: user.id, walletAddress: user.walletAddress };
+  return { userId: user!.id, walletAddress: user!.walletAddress };
 }
 
 // ═══════════════════════════════════════════════════════════════
