@@ -43,6 +43,13 @@
       "when": 1772662707448,
       "tag": "0005_watery_hawkeye",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1772971200000,
+      "tag": "0006_rename_sentinel_to_seal",
+      "breakpoints": true
     }
   ]
 }
