@@ -4,8 +4,10 @@
  * Run: npm run db:seed
  */
 
+import { runMigrations } from "./index.js";
 import db from "./index.js";
 import { strategyPresets } from "./schema.js";
+import { eq, and } from "drizzle-orm";
 
 const SYSTEM_PRESETS = [
   {
@@ -75,17 +77,24 @@ const SYSTEM_PRESETS = [
 ];
 
 async function seed() {
+  console.log("🌱 Running migrations...");
+  await runMigrations();
+
   console.log("🌱 Seeding strategy presets...");
 
   for (const preset of SYSTEM_PRESETS) {
     // Upsert: insert or skip if exists
-    const existing = db.query.strategyPresets.findFirst({
-      where: (sp, { eq, and }) =>
-        and(eq(sp.name, preset.name), eq(sp.isSystem, true)),
-    });
+    const [existing] = await db.select()
+      .from(strategyPresets)
+      .where(
+        and(
+          eq(strategyPresets.name, preset.name),
+          eq(strategyPresets.isSystem, true)
+        )
+      );
 
     if (!existing) {
-      db.insert(strategyPresets).values(preset).run();
+      await db.insert(strategyPresets).values(preset);
       console.log(`  ✅ ${preset.name}`);
     } else {
       console.log(`  ⏭️  ${preset.name} (already exists)`);
@@ -93,6 +102,7 @@ async function seed() {
   }
 
   console.log("🌱 Seeding complete.");
+  process.exit(0);
 }
 
 seed().catch(console.error);

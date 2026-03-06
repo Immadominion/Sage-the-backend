@@ -1,12 +1,47 @@
 {
   "version": "7",
-  "dialect": "sqlite",
+  "dialect": "postgresql",
   "entries": [
     {
       "idx": 0,
-      "version": "6",
-      "when": 1772309878554,
-      "tag": "0000_worried_warlock",
+      "version": "7",
+      "when": 1772550376960,
+      "tag": "0000_dry_miss_america",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1772556045404,
+      "tag": "0001_mute_santa_claus",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1772575201153,
+      "tag": "0002_rare_barracuda",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1772630880548,
+      "tag": "0003_cultured_kid_colt",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1772657591684,
+      "tag": "0004_chemical_aqueduct",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1772662707448,
+      "tag": "0005_watery_hawkeye",
       "breakpoints": true
     }
   ]

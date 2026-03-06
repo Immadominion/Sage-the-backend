@@ -85,7 +85,7 @@ events.get("/stream", async (c) => {
 
     // Keep the stream open indefinitely
     // The stream closes when the client disconnects (onAbort fires)
-    await new Promise(() => {});
+    await new Promise(() => { });
   });
 });
 

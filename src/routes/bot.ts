@@ -19,9 +19,10 @@ import { requireAuth, type AuthVariables } from "../middleware/auth.js";
 import { createApiError } from "../middleware/error.js";
 import db from "../db/index.js";
 import { bots, positions, tradeLog } from "../db/schema.js";
-import { eq, and, sql } from "drizzle-orm";
+import { eq, and, sql, isNull } from "drizzle-orm";
 import { orchestrator } from "../engine/orchestrator.js";
 import { LAMPORTS_PER_SOL } from "../engine/types.js";
+import config from "../config.js";
 
 const bot = new Hono<{ Variables: AuthVariables }>();
 
@@ -33,7 +34,7 @@ bot.use("/*", requireAuth);
 // ═══════════════════════════════════════════════════════════════
 
 const createBotSchema = z.object({
-  name: z.string().min(1).max(64).default("My Bot"),
+  name: z.string().min(1).max(64).optional(),
   mode: z.enum(["simulation", "live"]).default("simulation"),
   strategyMode: z.enum(["rule-based", "sage-ai", "both"]).default("rule-based"),
   // Entry criteria
@@ -55,6 +56,8 @@ const createBotSchema = z.object({
   cronIntervalSeconds: z.number().int().min(10).max(300).default(30),
   // Simulation
   simulationBalanceSOL: z.number().positive().default(10),
+  // Visibility
+  isPublic: z.boolean().default(false),
 });
 
 const updateBotConfigSchema = createBotSchema.partial().omit({ mode: true });
@@ -76,12 +79,12 @@ function generateBotId(): string {
   return crypto.randomBytes(4).toString("hex");
 }
 
-function getUserBot(userId: number, botId: string) {
-  return db
+async function getUserBot(userId: number, botId: string) {
+  const [row] = await db
     .select()
     .from(bots)
-    .where(and(eq(bots.botId, botId), eq(bots.userId, userId)))
-    .get();
+    .where(and(eq(bots.botId, botId), eq(bots.userId, userId)));
+  return row;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -96,24 +99,57 @@ bot.post("/create", zValidator("json", createBotSchema), async (c) => {
   const userId = c.var.userId;
   const body = c.req.valid("json");
 
-  // Limit bots per user
-  const existingBots = db
+  // Limit bots per user (exclude soft-deleted)
+  const [existingBots] = await db
     .select({ count: sql<number>`count(*)` })
     .from(bots)
-    .where(eq(bots.userId, userId))
-    .get();
+    .where(and(eq(bots.userId, userId), isNull(bots.deletedAt)));
 
-  if (existingBots && existingBots.count >= 10) {
+  const botCount = existingBots?.count ?? 0;
+
+  if (botCount >= 10) {
     throw createApiError("Maximum 10 bots per user", 400);
+  }
+
+  // ── Validate live mode prerequisites ──
+  if (body.mode === "live" && config.SOLANA_NETWORK !== "mainnet-beta") {
+    throw createApiError(
+      `Live trading requires mainnet (current network: ${config.SOLANA_NETWORK}). ` +
+      `Use simulation mode for testing on ${config.SOLANA_NETWORK}.`,
+      400
+    );
+  }
+
+  // Auto-generate sequential name if not provided by client
+  const botName = body.name ?? `Strategy ${botCount + 1}`;
+
+  // Enforce unique bot names per user (case-insensitive, exclude deleted)
+  if (body.name) {
+    const [duplicate] = await db
+      .select({ id: bots.id })
+      .from(bots)
+      .where(
+        and(
+          eq(bots.userId, userId),
+          sql`lower(${bots.name}) = lower(${body.name})`,
+          isNull(bots.deletedAt)
+        )
+      );
+    if (duplicate) {
+      throw createApiError(
+        `A bot named "${body.name}" already exists. Choose a different name.`,
+        409
+      );
+    }
   }
 
   const botId = generateBotId();
 
-  db.insert(bots)
+  await db.insert(bots)
     .values({
       botId,
       userId,
-      name: body.name,
+      name: botName,
       mode: body.mode,
       strategyMode: body.strategyMode,
       entryScoreThreshold: body.entryScoreThreshold,
@@ -130,20 +166,18 @@ bot.post("/create", zValidator("json", createBotSchema), async (c) => {
       cooldownMinutes: body.cooldownMinutes,
       cronIntervalSeconds: body.cronIntervalSeconds,
       simulationBalanceSOL: body.simulationBalanceSOL,
-    })
-    .run();
+    });
 
   // Log the creation
-  db.insert(tradeLog)
+  await db.insert(tradeLog)
     .values({
       botId,
       userId,
       event: "bot_started", // reuse closest enum value
       details: JSON.stringify({ action: "created", config: body }),
-    })
-    .run();
+    });
 
-  const created = getUserBot(userId, botId);
+  const created = await getUserBot(userId, botId);
 
   return c.json({ success: true, bot: created }, 201);
 });
@@ -155,13 +189,29 @@ bot.post("/create", zValidator("json", createBotSchema), async (c) => {
 bot.get("/list", async (c) => {
   const userId = c.var.userId;
 
-  const userBots = db
+  const userBots = await db
     .select()
     .from(bots)
-    .where(eq(bots.userId, userId))
-    .all();
+    .where(and(eq(bots.userId, userId), isNull(bots.deletedAt)));
 
-  return c.json({ success: true, bots: userBots });
+  // Enrich each bot with the authoritative current balance
+  const enriched = userBots.map((b) => {
+    const performanceSummary = orchestrator.getPerformanceSummary(b.botId);
+    let currentBalanceSol: number;
+    if (performanceSummary) {
+      currentBalanceSol = performanceSummary.currentBalanceSol;
+    } else if (b.currentVirtualBalanceLamports != null) {
+      currentBalanceSol = b.currentVirtualBalanceLamports / LAMPORTS_PER_SOL;
+    } else if (b.mode === 'live') {
+      // Live bots that have never run have no balance yet — show 0
+      currentBalanceSol = 0;
+    } else {
+      currentBalanceSol = b.simulationBalanceSOL;
+    }
+    return { ...b, currentBalanceSol };
+  });
+
+  return c.json({ success: true, bots: enriched });
 });
 
 /**
@@ -173,13 +223,13 @@ bot.get("/:botId", async (c) => {
   const botId = c.req.param("botId");
   validateBotId(botId);
 
-  const botData = getUserBot(userId, botId);
+  const botData = await getUserBot(userId, botId);
   if (!botData) {
     throw createApiError("Bot not found", 404);
   }
 
   // Count active positions
-  const activePositions = db
+  const [activePositions] = await db
     .select({ count: sql<number>`count(*)` })
     .from(positions)
     .where(
@@ -187,31 +237,48 @@ bot.get("/:botId", async (c) => {
         eq(positions.botId, botId),
         eq(positions.status, "active")
       )
-    )
-    .get();
+    );
 
   // S2: Include live engine stats if bot is running
   const engineStats = orchestrator.getEngineStats(botId);
   const performanceSummary = orchestrator.getPerformanceSummary(botId);
   const livePositions = orchestrator.getActivePositions(botId);
 
+  // Compute the authoritative balance:
+  //  1. If bot is running → live value from executor (most up-to-date)
+  //  2. If persisted in DB → restored value from last stop/trade
+  //  3. Live mode never-started → 0 (no simulation balance for live)
+  //  4. Sim mode never-started → config simulationBalanceSOL
+  let currentBalanceSol: number;
+  if (performanceSummary) {
+    currentBalanceSol = performanceSummary.currentBalanceSol;
+  } else if (botData.currentVirtualBalanceLamports != null) {
+    currentBalanceSol = botData.currentVirtualBalanceLamports / LAMPORTS_PER_SOL;
+  } else if (botData.mode === 'live') {
+    currentBalanceSol = 0;
+  } else {
+    currentBalanceSol = botData.simulationBalanceSOL;
+  }
+
   return c.json({
     success: true,
     bot: botData,
-    activePositionCount: activePositions?.count ?? 0,
+    /** Current simulation balance in SOL — always accurate, even when stopped */
+    currentBalanceSol,
+    activePositionCount: Number(activePositions?.count ?? 0),
     engineRunning: orchestrator.isRunning(botId),
     engineStats: engineStats
       ? {
-          totalScans: engineStats.totalScans,
-          positionsOpened: engineStats.positionsOpened,
-          positionsClosed: engineStats.positionsClosed,
-          wins: engineStats.wins,
-          losses: engineStats.losses,
-          winRate: engineStats.winRate,
-          totalPnlSol:
-            engineStats.totalPnlLamports.toNumber() / LAMPORTS_PER_SOL,
-          runtime: engineStats.runtime,
-        }
+        totalScans: engineStats.totalScans,
+        positionsOpened: engineStats.positionsOpened,
+        positionsClosed: engineStats.positionsClosed,
+        wins: engineStats.wins,
+        losses: engineStats.losses,
+        winRate: engineStats.winRate,
+        totalPnlSol:
+          engineStats.totalPnlLamports.toNumber() / LAMPORTS_PER_SOL,
+        runtime: engineStats.runtime,
+      }
       : null,
     performanceSummary: performanceSummary ?? null,
     livePositions: livePositions.map((p) => ({
@@ -239,7 +306,7 @@ bot.put(
     validateBotId(botId);
     const updates = c.req.valid("json");
 
-    const botData = getUserBot(userId, botId);
+    const botData = await getUserBot(userId, botId);
     if (!botData) {
       throw createApiError("Bot not found", 404);
     }
@@ -251,12 +318,80 @@ bot.put(
       );
     }
 
-    db.update(bots)
-      .set({ ...updates, updatedAt: new Date().toISOString() })
-      .where(and(eq(bots.botId, botId), eq(bots.userId, userId)))
-      .run();
+    // If the user changes the starting simulation balance, reset the
+    // persisted virtual balance so the next start uses the new config value.
+    // Also reset accumulated stats since this is effectively a "new session".
+    const resetBalance = updates.simulationBalanceSOL != null &&
+      updates.simulationBalanceSOL !== botData.simulationBalanceSOL;
 
-    const updated = getUserBot(userId, botId);
+    await db.update(bots)
+      .set({
+        ...updates,
+        ...(resetBalance
+          ? {
+            currentVirtualBalanceLamports: null,
+            totalTrades: 0,
+            winningTrades: 0,
+            totalPnlLamports: 0,
+            emergencyStopState: null,
+          }
+          : {}),
+        updatedAt: new Date(),
+      })
+      .where(and(eq(bots.botId, botId), eq(bots.userId, userId)));
+
+    const updated = await getUserBot(userId, botId);
+    return c.json({ success: true, bot: updated });
+  }
+);
+
+/**
+ * PUT /bot/:botId/rename
+ * Rename a bot (allowed regardless of status).
+ */
+const renameBotSchema = z.object({
+  name: z.string().min(1).max(64),
+});
+
+bot.put(
+  "/:botId/rename",
+  zValidator("json", renameBotSchema),
+  async (c) => {
+    const userId = c.var.userId;
+    const botId = c.req.param("botId");
+    validateBotId(botId);
+    const { name } = c.req.valid("json");
+
+    const botData = await getUserBot(userId, botId);
+    if (!botData) {
+      throw createApiError("Bot not found", 404);
+    }
+
+    // Enforce unique name per user (case-insensitive, exclude deleted + self)
+    const [duplicate] = await db
+      .select({ id: bots.id })
+      .from(bots)
+      .where(
+        and(
+          eq(bots.userId, userId),
+          sql`lower(${bots.name}) = lower(${name})`,
+          isNull(bots.deletedAt),
+          sql`${bots.botId} != ${botId}`
+        )
+      );
+    if (duplicate) {
+      throw createApiError(
+        `A bot named "${name}" already exists. Choose a different name.`,
+        409
+      );
+    }
+
+    await db
+      .update(bots)
+      .set({ name, updatedAt: new Date() })
+      .where(and(eq(bots.botId, botId), eq(bots.userId, userId)));
+
+    const updated = await getUserBot(userId, botId);
     return c.json({ success: true, bot: updated });
   }
 );
@@ -270,7 +405,7 @@ bot.post("/:botId/start", async (c) => {
   const botId = c.req.param("botId");
   validateBotId(botId);
 
-  const botData = getUserBot(userId, botId);
+  const botData = await getUserBot(userId, botId);
   if (!botData) {
     throw createApiError("Bot not found", 404);
   }
@@ -279,39 +414,38 @@ bot.post("/:botId/start", async (c) => {
     throw createApiError("Bot is already running", 400);
   }
 
-  // Update status to running
-  db.update(bots)
+  // Update status to running and clear stale error + emergency stop state
+  await db.update(bots)
     .set({
       status: "running",
-      lastActivityAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
+      lastError: null,
+      emergencyStopState: null,
+      lastActivityAt: new Date(),
+      updatedAt: new Date(),
     })
-    .where(and(eq(bots.botId, botId), eq(bots.userId, userId)))
-    .run();
+    .where(and(eq(bots.botId, botId), eq(bots.userId, userId)));
 
   // Log start event
-  db.insert(tradeLog)
+  await db.insert(tradeLog)
     .values({
       botId,
       userId,
       event: "bot_started",
       details: JSON.stringify({ mode: botData.mode }),
-    })
-    .run();
+    });
 
   // S2: Spawn TradingEngine via BotOrchestrator
   try {
     await orchestrator.startBot(botId, userId);
   } catch (error) {
     // Revert status on failure
-    db.update(bots)
+    await db.update(bots)
       .set({
         status: "error",
         lastError: error instanceof Error ? error.message : String(error),
-        updatedAt: new Date().toISOString(),
+        updatedAt: new Date(),
       })
-      .where(and(eq(bots.botId, botId), eq(bots.userId, userId)))
-      .run();
+      .where(and(eq(bots.botId, botId), eq(bots.userId, userId)));
 
     throw createApiError(
       `Failed to start bot: ${error instanceof Error ? error.message : String(error)}`,
@@ -331,7 +465,7 @@ bot.post("/:botId/stop", async (c) => {
   const botId = c.req.param("botId");
   validateBotId(botId);
 
-  const botData = getUserBot(userId, botId);
+  const botData = await getUserBot(userId, botId);
   if (!botData) {
     throw createApiError("Bot not found", 404);
   }
@@ -340,23 +474,21 @@ bot.post("/:botId/stop", async (c) => {
     throw createApiError("Bot is already stopped", 400);
   }
 
-  db.update(bots)
+  await db.update(bots)
     .set({
       status: "stopped",
-      updatedAt: new Date().toISOString(),
+      updatedAt: new Date(),
     })
-    .where(and(eq(bots.botId, botId), eq(bots.userId, userId)))
-    .run();
+    .where(and(eq(bots.botId, botId), eq(bots.userId, userId)));
 
   // Log stop event
-  db.insert(tradeLog)
+  await db.insert(tradeLog)
     .values({
       botId,
       userId,
       event: "bot_stopped",
       details: JSON.stringify({ reason: "user_requested" }),
-    })
-    .run();
+    });
 
   // S2: Stop TradingEngine via BotOrchestrator
   await orchestrator.stopBot(botId);
@@ -373,42 +505,39 @@ bot.post("/:botId/emergency", async (c) => {
   const botId = c.req.param("botId");
   validateBotId(botId);
 
-  const botData = getUserBot(userId, botId);
+  const botData = await getUserBot(userId, botId);
   if (!botData) {
     throw createApiError("Bot not found", 404);
   }
 
   // Mark bot as stopped
-  db.update(bots)
+  await db.update(bots)
     .set({
       status: "stopped",
       lastError: "Emergency stop triggered by user",
-      updatedAt: new Date().toISOString(),
+      updatedAt: new Date(),
     })
-    .where(and(eq(bots.botId, botId), eq(bots.userId, userId)))
-    .run();
+    .where(and(eq(bots.botId, botId), eq(bots.userId, userId)));
 
   // Mark all active positions as closing
-  db.update(positions)
+  await db.update(positions)
     .set({
       status: "closing",
       exitReason: "emergency_stop",
-      updatedAt: new Date().toISOString(),
+      updatedAt: new Date(),
     })
     .where(
       and(eq(positions.botId, botId), eq(positions.status, "active"))
-    )
-    .run();
+    );
 
   // Log
-  db.insert(tradeLog)
+  await db.insert(tradeLog)
     .values({
       botId,
       userId,
       event: "bot_stopped",
       details: JSON.stringify({ reason: "emergency_stop" }),
-    })
-    .run();
+    });
 
   // S2: Emergency stop via BotOrchestrator
   await orchestrator.emergencyStop(botId);
@@ -425,28 +554,41 @@ bot.delete("/:botId", async (c) => {
   const botId = c.req.param("botId");
   validateBotId(botId);
 
-  const botData = getUserBot(userId, botId);
+  const botData = await getUserBot(userId, botId);
   if (!botData) {
     throw createApiError("Bot not found", 404);
   }
 
-  if (botData.status !== "stopped") {
-    throw createApiError(
-      "Cannot delete a running bot. Stop it first.",
-      400
-    );
+  // Allow deletion if bot is stopped or in error state.
+  // If running/starting/stopping, stop the engine first then delete.
+  if (botData.status === "running" || botData.status === "starting" || botData.status === "stopping") {
+    // Auto-stop the engine before deleting
+    try {
+      await orchestrator.stopBot(botId);
+    } catch (_) {
+      // Best-effort stop — engine may not be running
+    }
+    await db.update(bots)
+      .set({ status: "stopped", updatedAt: new Date() })
+      .where(and(eq(bots.botId, botId), eq(bots.userId, userId)));
   }
 
-  // Delete in order (foreign key safety)
-  db.delete(tradeLog)
-    .where(eq(tradeLog.botId, botId))
-    .run();
-  db.delete(positions)
-    .where(eq(positions.botId, botId))
-    .run();
-  db.delete(bots)
-    .where(and(eq(bots.botId, botId), eq(bots.userId, userId)))
-    .run();
+  // Soft-delete: preserve trade history forever.
+  // Clear agent/session keys so the wallet can be reused by a new bot,
+  // but keep agentPubkey + agentConfigAddress for on-chain audit trail.
+  await db.update(bots)
+    .set({
+      deletedAt: new Date(),
+      // Release session so a new bot can use this wallet later
+      sessionAddress: null,
+      sessionPubkey: null,
+      sessionSecretKey: null,
+      // Keep agentPubkey/agentConfigAddress for audit (on-chain references)
+      // Clear secret key — deleted bots should not sign anything
+      agentSecretKey: null,
+      updatedAt: new Date(),
+    })
+    .where(and(eq(bots.botId, botId), eq(bots.userId, userId)));
 
   return c.json({ success: true, deleted: true });
 });

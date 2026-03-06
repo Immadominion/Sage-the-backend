@@ -129,6 +129,10 @@ export class MarketDataProvider implements IMarketDataProvider {
 
   /**
    * Get or create a DLMM instance (cached).
+   *
+   * Throws a clear error if the pool doesn't exist on-chain.
+   * This typically happens when RPC points to devnet but pool addresses
+   * come from the mainnet Meteora API.
    */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   async getDLMM(poolAddress: string): Promise<any> {
@@ -138,6 +142,17 @@ export class MarketDataProvider implements IMarketDataProvider {
     }
 
     const poolPubkey = new PublicKey(poolAddress);
+
+    // Pre-check: verify the account exists on-chain before DLMM.create
+    const accountInfo = await this.connection.getAccountInfo(poolPubkey);
+    if (!accountInfo) {
+      throw new Error(
+        `LB Pair account ${poolAddress} not found on-chain. ` +
+        `This usually means the RPC is on devnet but the pool exists on mainnet. ` +
+        `Check SOLANA_NETWORK and SOLANA_RPC_URL in your .env.`
+      );
+    }
+
     const dlmm = await DLMM.create(this.connection, poolPubkey);
     this.dlmmCache.set(poolAddress, { dlmm, timestamp: Date.now() });
     return dlmm;

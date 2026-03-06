@@ -1,6 +1,6 @@
 {
-  "id": "b74df402-f507-48d9-b113-fb31bb46197e",
-  "prevId": "00000000-0000-0000-0000-000000000000",
+  "id": "56cbe0f2-0ac8-4a0b-a0d8-7f52eceda09f",
+  "prevId": "e0cf757b-2015-49f8-8162-e496f0791685",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -152,6 +152,12 @@
           "notNull": true,
           "default": 10
         },
+        "current_virtual_balance_lamports": {
+          "name": "current_virtual_balance_lamports",
+          "type": "bigint",
+          "primaryKey": false,
+          "notNull": false
+        },
         "total_trades": {
           "name": "total_trades",
           "type": "integer",
@@ -185,8 +191,33 @@
           "primaryKey": false,
           "notNull": false
         },
+        "is_public": {
+          "name": "is_public",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
         "emergency_stop_state": {
           "name": "emergency_stop_state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "agent_pubkey": {
+          "name": "agent_pubkey",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "agent_config_address": {
+          "name": "agent_config_address",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "session_address": {
+          "name": "session_address",
           "type": "text",
           "primaryKey": false,
           "notNull": false
@@ -281,6 +312,145 @@
           "nullsNotDistinct": false,
           "columns": [
             "bot_id"
+          ]
+        }
+      },
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.conversations": {
+      "name": "conversations",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "serial",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "conversation_id": {
+          "name": "conversation_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "user_id": {
+          "name": "user_id",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "type": {
+          "name": "type",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'general'"
+        },
+        "title": {
+          "name": "title",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "messages": {
+          "name": "messages",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'[]'::jsonb"
+        },
+        "extracted_params": {
+          "name": "extracted_params",
+          "type": "jsonb",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "timestamp with time zone",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "now()"
+        }
+      },
+      "indexes": {
+        "conversations_conversation_id_idx": {
+          "name": "conversations_conversation_id_idx",
+          "columns": [
+            {
+              "expression": "conversation_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "conversations_user_id_idx": {
+          "name": "conversations_user_id_idx",
+          "columns": [
+            {
+              "expression": "user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "conversations_type_idx": {
+          "name": "conversations_type_idx",
+          "columns": [
+            {
+              "expression": "type",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "conversations_user_id_users_id_fk": {
+          "name": "conversations_user_id_users_id_fk",
+          "tableFrom": "conversations",
+          "tableTo": "users",
+          "columnsFrom": [
+            "user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "no action",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {
+        "conversations_conversation_id_unique": {
+          "name": "conversations_conversation_id_unique",
+          "nullsNotDistinct": false,
+          "columns": [
+            "conversation_id"
           ]
         }
       },
@@ -950,6 +1120,12 @@
         "exec_mode": {
           "name": "exec_mode",
           "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "setup_progress": {
+          "name": "setup_progress",
+          "type": "jsonb",
           "primaryKey": false,
           "notNull": false
         },

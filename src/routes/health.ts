@@ -6,7 +6,7 @@
  */
 
 import { Hono } from "hono";
-import { getConnection, SENTINEL_PROGRAM_ID } from "../services/solana.js";
+import { getConnection, SEAL_PROGRAM_ID } from "../services/solana.js";
 import config from "../config.js";
 import db from "../db/index.js";
 import { users } from "../db/schema.js";
@@ -25,7 +25,7 @@ health.get("/", async (c) => {
     uptime: Math.floor((Date.now() - startTime) / 1000),
     environment: config.NODE_ENV,
     network: config.SOLANA_NETWORK,
-    programId: SENTINEL_PROGRAM_ID.toBase58(),
+    programId: SEAL_PROGRAM_ID.toBase58(),
   };
 
   // Solana RPC check
@@ -50,10 +50,9 @@ health.get("/", async (c) => {
 
   // Database check
   try {
-    const result = db
+    const [result] = await db
       .select({ count: sql<number>`count(*)` })
-      .from(users)
-      .get();
+      .from(users);
     checks.database = "connected";
     checks.userCount = result?.count ?? 0;
   } catch (err) {

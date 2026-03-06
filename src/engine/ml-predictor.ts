@@ -131,7 +131,7 @@ export class MLPredictor {
   get isHealthy(): boolean {
     if (Date.now() - this.lastHealthCheck > this.HEALTH_CHECK_INTERVAL_MS) {
       // Stale — trigger async refresh (non-blocking)
-      this.checkHealth().catch(() => {});
+      this.checkHealth().catch(() => { });
     }
     return this.healthy;
   }
@@ -216,7 +216,7 @@ export class MLPredictor {
       this.healthy = false;
       log.error(
         { err: error instanceof Error ? error.message : String(error) },
-        "ML prediction failed — falling back to rule-based"
+        "ML prediction failed — service unreachable"
       );
       return null;
     }

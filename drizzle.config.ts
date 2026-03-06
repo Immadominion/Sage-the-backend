@@ -4,8 +4,8 @@ import { defineConfig } from "drizzle-kit";
 export default defineConfig({
   out: "./drizzle",
   schema: "./src/db/schema.ts",
-  dialect: "sqlite",
+  dialect: "postgresql",
   dbCredentials: {
-    url: process.env.DATABASE_URL?.replace(/^file:/, "") || "sage.db",
+    url: process.env.DATABASE_URL || "postgresql://localhost:5432/sage",
   },
 });

@@ -445,8 +445,11 @@ export class TradingEngine {
     );
 
     if (!predictions) {
-      log.warn({ label: this.label }, "ML prediction failed, falling back to rule-based");
-      return this.scoreRuleBased(pools, slotsAvailable);
+      log.error(
+        { label: this.label },
+        "ML prediction failed — skipping scan (sage-ai mode does NOT fall back to rule-based)"
+      );
+      return [];
     }
 
     // Combine with market scores and filter by ML recommendation
@@ -542,8 +545,13 @@ export class TradingEngine {
     );
 
     if (!predictions) {
-      // ML unavailable — fall back to pure rule-based
-      return candidates.slice(0, slotsAvailable);
+      // ML unavailable — do NOT fall back to pure rule-based.
+      // The user chose hybrid mode; entering without ML approval violates their intent.
+      log.error(
+        { label: this.label },
+        "ML prediction failed — skipping scan (hybrid mode requires ML approval)"
+      );
+      return [];
     }
 
     // Step 3: Only enter where BOTH agree
