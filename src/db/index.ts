@@ -1,60 +1,67 @@
 /**
- * Database connection — Drizzle ORM + better-sqlite3
+ * Database connection — Drizzle ORM + PostgreSQL (node-postgres)
  *
- * Using SQLite for the MVP. Can swap to PostgreSQL (Supabase)
- * by changing the driver import and connection string.
- *
- * Production pragmas:
- *  - WAL mode for concurrent reads
- *  - foreign_keys enforced
- *  - busy_timeout to retry on SQLITE_BUSY instead of throwing
- *  - synchronous=NORMAL for safe WAL writes with better perf
+ * Production-grade setup:
+ *  - Connection pooling via pg.Pool
+ *  - Auto-migration on startup (Drizzle migrator)
+ *  - Graceful shutdown with pool.end()
+ *  - SSL support for Railway/cloud providers
  */
 
-import { drizzle } from "drizzle-orm/better-sqlite3";
-import { migrate } from "drizzle-orm/better-sqlite3/migrator";
-import Database from "better-sqlite3";
+import { drizzle } from "drizzle-orm/node-postgres";
+import { migrate } from "drizzle-orm/node-postgres/migrator";
+import pg from "pg";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import config from "../config.js";
 import * as schema from "./schema.js";
 
-// Strip the "file:" prefix if present (better-sqlite3 expects a path)
-const dbPath = config.DATABASE_URL.replace(/^file:/, "");
+const { Pool } = pg;
 
-const sqlite = new Database(dbPath);
+const pool = new Pool({
+  connectionString: config.DATABASE_URL,
+  max: 20,                 // max connections in pool
+  idleTimeoutMillis: 30000, // close idle clients after 30s
+  connectionTimeoutMillis: 5000, // fail fast if can't connect
+  // Railway/cloud providers typically need SSL
+  ssl: config.NODE_ENV === "production"
+    ? { rejectUnauthorized: false }
+    : undefined,
+});
 
-// Production-grade SQLite pragmas
-sqlite.pragma("journal_mode = WAL");
-sqlite.pragma("foreign_keys = ON");
-sqlite.pragma("busy_timeout = 5000");   // 5s retry on SQLITE_BUSY
-sqlite.pragma("synchronous = NORMAL");  // safe with WAL, 2x faster than FULL
+export const db = drizzle(pool, { schema });
 
-export const db = drizzle(sqlite, { schema });
+/**
+ * Run Drizzle migrations on startup.
+ * Must be called (and awaited) before the server starts accepting requests.
+ */
+export async function runMigrations(): Promise<void> {
+  const __filename = fileURLToPath(import.meta.url);
+  const __dirname = dirname(__filename);
+  const migrationsFolder = resolve(__dirname, "..", "..", "drizzle");
 
-// Auto-migrate on startup — creates tables if they don't exist.
-// Uses the generated SQL files in /drizzle (copied into Docker image).
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-const migrationsFolder = resolve(__dirname, "..", "..", "drizzle");
+  try {
+    await migrate(db, { migrationsFolder });
+    console.log("✅ Database migrations applied successfully");
+  } catch (err: unknown) {
+    // Check the full error chain (DrizzleQueryError wraps pg errors in .cause)
+    const fullText = JSON.stringify(err, Object.getOwnPropertyNames(err ?? {}));
+    const causeText = (err as any)?.cause?.message ?? "";
+    const msg = err instanceof Error ? err.message : String(err);
+    const combined = `${msg} ${causeText} ${fullText}`;
 
-try {
-  migrate(db, { migrationsFolder });
-  console.log("✅ Database migrations applied successfully");
-} catch (err: unknown) {
-  // If tables already exist (from db:push), that's fine — skip.
-  const msg = err instanceof Error ? err.message : String(err);
-  if (msg.includes("already exists")) {
-    console.log("ℹ️  Database tables already exist — skipping migration");
-  } else {
-    console.error("❌ Database migration failed:", err);
-    process.exit(1);
+    if (combined.includes("already exists") || combined.includes("already been applied")) {
+      console.log("ℹ️  Database schema up to date — skipping migration");
+    } else {
+      console.error("❌ Database migration failed:", err);
+      process.exit(1);
+    }
   }
 }
 
-/** Close the underlying SQLite connection. Call during graceful shutdown. */
-export function closeDatabase(): void {
-  sqlite.close();
+/** Close the connection pool. Call during graceful shutdown. */
+export async function closeDatabase(): Promise<void> {
+  await pool.end();
 }
 
 export type Database = typeof db;

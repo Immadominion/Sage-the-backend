@@ -52,3 +52,30 @@ export const requireAuth = createMiddleware<{
 
   await next();
 });
+
+/**
+ * Optional auth — sets userId/walletAddress if a valid token is present,
+ * but does NOT block the request if missing or invalid.
+ * Use for endpoints that show different data to authenticated vs anonymous users.
+ */
+export const optionalAuth = createMiddleware<{
+  Variables: AuthVariables;
+}>(async (c, next) => {
+  const authHeader = c.req.header("Authorization");
+
+  if (authHeader?.startsWith("Bearer ")) {
+    const token = authHeader.slice(7);
+    try {
+      const payload = await verifyAccessToken(token);
+      if (payload.sub && payload.userId) {
+        c.set("userId", payload.userId);
+        c.set("walletAddress", payload.sub);
+        c.set("jwtPayload", payload);
+      }
+    } catch {
+      // Silently ignore — user is treated as anonymous
+    }
+  }
+
+  await next();
+});

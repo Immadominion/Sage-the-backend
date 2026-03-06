@@ -6,7 +6,7 @@
  * Architecture:
  *  - Auth:    SIWS (Sign-In With Solana) → JWT
  *  - Routes:  /auth, /wallet, /bot, /strategy, /health
- *  - DB:      SQLite via Drizzle ORM (production-grade with WAL mode)
+ *  - DB:      PostgreSQL via Drizzle ORM (production-grade with connection pooling)
  *  - Guards:  JWT validation, Zod input validation, rate limiting
  *  - Security: CORS lockdown, secure headers, body size limits, request IDs
  */
@@ -33,10 +33,12 @@ import strategyRoutes from "./routes/strategy.js";
 import mlRoutes from "./routes/ml.js";
 import eventsRoutes from "./routes/events.js";
 import positionRoutes from "./routes/position.js";
+import aiRoutes from "./routes/ai.js";
+import fleetRoutes from "./routes/fleet.js";
 
 // Engine
 import { orchestrator } from "./engine/orchestrator.js";
-import { closeDatabase } from "./db/index.js";
+import { closeDatabase, runMigrations } from "./db/index.js";
 
 // ═══════════════════════════════════════════════════════════════
 // App
@@ -59,6 +61,23 @@ if (config.NODE_ENV === "production" && config.CORS_ORIGINS === "*") {
   logger.warn("⚠️  CORS_ORIGINS is wildcard in production! Set explicit origins.");
 }
 
+logger.info(
+  {
+    network: config.SOLANA_NETWORK,
+    rpcUrl: config.SOLANA_RPC_URL,
+    sealProgramId: config.SEAL_PROGRAM_ID,
+    sponsorEnabled: Boolean(
+      config.SPONSOR_KEYPAIR ||
+      (config.TURNKEY_API_PUBLIC_KEY && config.TURNKEY_SPONSOR_ADDRESS)
+    ),
+    extraAllowedPrograms:
+      config.SOLANA_NETWORK === "mainnet-beta"
+        ? config.SEAL_ALLOWED_PROGRAMS_MAINNET ?? config.SEAL_ALLOWED_PROGRAMS ?? ""
+        : config.SEAL_ALLOWED_PROGRAMS_DEVNET ?? config.SEAL_ALLOWED_PROGRAMS ?? "",
+  },
+  "Backend startup configuration"
+);
+
 app.use(
   "*",
   cors({
@@ -72,6 +91,9 @@ app.use(
 
 // ── Security: Body size limit (1MB default, prevents payload abuse) ──
 app.use("*", bodyLimit({ maxSize: 1024 * 1024 }));
+
+// ── Audio uploads need a larger body limit (25MB per OpenAI max) ──
+app.use("/ai/transcribe", bodyLimit({ maxSize: 25 * 1024 * 1024 }));
 
 // ── Security: Global rate limit (300 req/min per IP/user) ──
 app.use("*", globalRateLimit);
@@ -91,6 +113,12 @@ app.use("/bot/*/emergency", botLifecycleRateLimit);
 app.use("/ml/predict", mlRateLimit);
 app.use("/ml/reload", mlRateLimit);
 app.use("/position/*", readRateLimit);
+app.use("/ai/chat", mlRateLimit);
+app.use("/ai/transcribe", mlRateLimit);
+app.use("/ai/conversations", readRateLimit);
+app.use("/ai/conversations/*", readRateLimit);
+app.use("/ai/status", readRateLimit);
+app.use("/fleet/*", readRateLimit);
 app.use("/bot/list", readRateLimit);
 app.use("/wallet/*", readRateLimit);
 
@@ -103,6 +131,8 @@ app.route("/strategy", strategyRoutes);
 app.route("/ml", mlRoutes);
 app.route("/events", eventsRoutes);
 app.route("/position", positionRoutes);
+app.route("/ai", aiRoutes);
+app.route("/fleet", fleetRoutes);
 
 // ── 404 ──
 app.notFound((c) => c.json({
@@ -112,8 +142,11 @@ app.notFound((c) => c.json({
 }, 404));
 
 // ═══════════════════════════════════════════════════════════════
-// Start Server
+// Start Server (async — runs migrations first)
 // ═══════════════════════════════════════════════════════════════
+
+// Run PostgreSQL migrations before starting server
+await runMigrations();
 
 const server = serve(
   {
@@ -127,7 +160,7 @@ const server = serve(
     logger.info(`  Port:      ${info.port}`);
     logger.info(`  Network:   ${config.SOLANA_NETWORK}`);
     logger.info(`  RPC:       ${config.SOLANA_RPC_URL}`);
-    logger.info(`  Program:   ${config.SENTINEL_PROGRAM_ID}`);
+    logger.info(`  Program:   ${config.SEAL_PROGRAM_ID}`);
     logger.info(`  Database:  ${config.DATABASE_URL}`);
     logger.info("═".repeat(60));
     logger.info("Endpoints:");
@@ -157,6 +190,12 @@ const server = serve(
     logger.info("  GET  /position/history");
     logger.info("  GET  /position/bot/:botId");
     logger.info("  GET  /position/:positionId");
+    logger.info("  POST /ai/chat");
+    logger.info("  POST /ai/transcribe");
+    logger.info("  GET  /ai/conversations");
+    logger.info("  GET  /ai/conversations/:id");
+    logger.info("  DELETE /ai/conversations/:id");
+    logger.info("  GET  /ai/status");
     logger.info("");
 
     // S2: Recover any bots that were running before server restart
@@ -212,9 +251,9 @@ const shutdown = async (signal: string) => {
   clearTimeout(forceTimer);
   logger.info("Shutdown complete");
 
-  // Phase 3: Close database (flush WAL)
+  // Phase 3: Close database (connection pool)
   try {
-    closeDatabase();
+    await closeDatabase();
     logger.info("Database connection closed");
   } catch (err) {
     logger.error(

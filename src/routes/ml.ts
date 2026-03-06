@@ -151,7 +151,7 @@ ml.get("/feedback", requireAuth, async (c) => {
   const limit = Math.min(Number(c.req.query("limit") || "1000"), 5000);
 
   // Query closed positions that have entry features
-  const closedPositions = db
+  const allClosedPositions = (await db
     .select()
     .from(positions)
     .where(
@@ -160,8 +160,8 @@ ml.get("/feedback", requireAuth, async (c) => {
         isNotNull(positions.entryFeatures),
         isNotNull(positions.realizedPnlLamports)
       )
-    )
-    .all()
+    ));
+  const filteredPositions = allClosedPositions
     .filter((p) => {
       if (since > 0 && p.exitTimestamp) {
         return p.exitTimestamp > since;
@@ -171,7 +171,7 @@ ml.get("/feedback", requireAuth, async (c) => {
     .slice(0, limit);
 
   // Transform into feedback format matching online_learning.py expectations
-  const feedback = closedPositions.map((p) => {
+  const feedback = filteredPositions.map((p) => {
     let features: Record<string, number> = {};
     try {
       features = JSON.parse(p.entryFeatures!);

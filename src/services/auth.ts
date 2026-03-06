@@ -81,25 +81,22 @@ export async function generateNonce(walletAddress: string | null): Promise<strin
 
   if (walletAddress) {
     // Legacy flow: store nonce in user record
-    const existing = db
+    const [existing] = await db
       .select()
       .from(users)
-      .where(eq(users.walletAddress, walletAddress))
-      .get();
+      .where(eq(users.walletAddress, walletAddress));
 
     if (existing) {
-      db.update(users)
+      await db.update(users)
         .set({ authNonce: nonce, authNonceExpiresAt: expiresAt })
-        .where(eq(users.walletAddress, walletAddress))
-        .run();
+        .where(eq(users.walletAddress, walletAddress));
     } else {
-      db.insert(users)
+      await db.insert(users)
         .values({
           walletAddress,
           authNonce: nonce,
           authNonceExpiresAt: expiresAt,
-        })
-        .run();
+        });
     }
   } else {
     // MWA-safe flow: store nonce in memory
@@ -189,11 +186,10 @@ export async function verifySIWSSignature(
     standaloneNonces.delete(messageNonce);
   } else {
     // Legacy flow: nonce from user's DB record
-    const user = db
+    const [user] = await db
       .select()
       .from(users)
-      .where(eq(users.walletAddress, walletAddress))
-      .get();
+      .where(eq(users.walletAddress, walletAddress));
 
     if (!user || !user.authNonce) {
       throw new Error("No pending nonce for this wallet");
@@ -208,10 +204,9 @@ export async function verifySIWSSignature(
     }
 
     // Invalidate (single-use)
-    db.update(users)
+    await db.update(users)
       .set({ authNonce: null, authNonceExpiresAt: null })
-      .where(eq(users.walletAddress, walletAddress))
-      .run();
+      .where(eq(users.walletAddress, walletAddress));
   }
 
   // 5. Also validate the Issued At timestamp isn't too old (belt + suspenders)
@@ -225,24 +220,21 @@ export async function verifySIWSSignature(
   }
 
   // 6. Upsert user (create if first sign-in)
-  let user = db
+  let [existingUser] = await db
     .select()
     .from(users)
-    .where(eq(users.walletAddress, walletAddress))
-    .get();
+    .where(eq(users.walletAddress, walletAddress));
 
-  if (!user) {
-    db.insert(users)
-      .values({ walletAddress })
-      .run();
-    user = db
+  if (!existingUser) {
+    await db.insert(users)
+      .values({ walletAddress });
+    [existingUser] = await db
       .select()
       .from(users)
-      .where(eq(users.walletAddress, walletAddress))
-      .get();
+      .where(eq(users.walletAddress, walletAddress));
   }
 
-  return { userId: user!.id, walletAddress: user!.walletAddress };
+  return { userId: existingUser!.id, walletAddress: existingUser!.walletAddress };
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -281,10 +273,9 @@ export async function issueTokens(
     .update(refreshToken)
     .digest("hex");
 
-  db.update(users)
+  await db.update(users)
     .set({ refreshTokenHash: hash })
-    .where(eq(users.walletAddress, walletAddress))
-    .run();
+    .where(eq(users.walletAddress, walletAddress));
 
   return {
     accessToken,
@@ -322,16 +313,15 @@ export async function refreshTokens(
     .update(refreshToken)
     .digest("hex");
 
-  const user = db
+  const [refreshUser] = await db
     .select()
     .from(users)
-    .where(eq(users.walletAddress, walletAddress))
-    .get();
+    .where(eq(users.walletAddress, walletAddress));
 
-  if (!user || user.refreshTokenHash !== hash) {
+  if (!refreshUser || refreshUser.refreshTokenHash !== hash) {
     throw new Error("Refresh token revoked or invalid");
   }
 
   // Issue new token pair (rotation)
-  return issueTokens(user.id, user.walletAddress);
+  return issueTokens(refreshUser.id, refreshUser.walletAddress);
 }

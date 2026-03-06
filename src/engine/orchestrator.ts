@@ -20,13 +20,14 @@ import { Connection } from "@solana/web3.js";
 import BN from "bn.js";
 import config from "../config.js";
 import db from "../db/index.js";
-import { bots, positions, tradeLog } from "../db/schema.js";
+import { bots, positions, tradeLog, users } from "../db/schema.js";
 import { eq, and } from "drizzle-orm";
 import { logger } from "../middleware/logger.js";
 import { eventBus } from "./event-bus.js";
 import { TradingEngine, type EngineEvent, type EngineStats } from "./trading-engine.js";
 import { SimulationExecutor } from "./simulation-executor.js";
-import { LiveExecutor } from "./live-executor.js";
+import { SealExecutor } from "./seal-executor.js";
+import { SealSession } from "./seal-session.js";
 import { WalletManager } from "./wallet-manager.js";
 import { MarketDataProvider } from "./market-data.js";
 import { MLPredictor } from "./ml-predictor.js";
@@ -123,13 +124,22 @@ export class BotOrchestrator {
       return;
     }
 
-    const botRow = this.getBotRow(botId, userId);
+    const botRow = await this.getBotRow(botId, userId);
     if (!botRow) {
       throw new Error(`Bot ${botId} not found for user ${userId}`);
     }
 
     const botConfig = this.botRowToConfig(botRow);
     const isLiveMode = botRow.mode === "live";
+
+    // ── CRITICAL: Block live mode on devnet ──
+    // DLMM pools only exist on mainnet. Live trading on devnet is impossible.
+    if (isLiveMode && config.SOLANA_NETWORK !== "mainnet-beta") {
+      throw new Error(
+        `Live trading requires SOLANA_NETWORK=mainnet-beta (current: ${config.SOLANA_NETWORK}). ` +
+        `Meteora DLMM pools only exist on mainnet. Use simulation mode for testing.`
+      );
+    }
 
     // Create per-bot MarketDataProvider (shares SharedAPICache singleton)
     const marketData = new MarketDataProvider(this.connection, botConfig);
@@ -142,16 +152,16 @@ export class BotOrchestrator {
     if (needsML) {
       const health = await this.sharedMLPredictor.checkHealth();
       if (!health) {
-        log.warn(
-          { botId, strategyMode },
-          "ML service unavailable — bot will fall back to rule-based"
-        );
-      } else {
-        log.info(
-          { botId, model: health.model, threshold: health.threshold },
-          "ML service connected"
+        throw new Error(
+          `ML service is unavailable but strategyMode="${strategyMode}" requires it. ` +
+          `Ensure the ML service is running at ${config.ML_SERVICE_URL ?? "http://127.0.0.1:8100"} ` +
+          `or change strategyMode to "rule-based".`
         );
       }
+      log.info(
+        { botId, model: health.model, threshold: health.threshold },
+        "ML service connected"
+      );
     }
 
     // Create safety systems per-bot
@@ -176,6 +186,20 @@ export class BotOrchestrator {
       maxApiErrorsPerHour: 50,
     }, savedEmergencyState);
 
+    // If the emergency stop was triggered in a previous session, reset the
+    // trigger flag so the bot can trade again. The user explicitly chose to
+    // restart, so honour that intent. Loss counters are preserved — if the
+    // bot immediately hits the same limit it will re-trigger.
+    if (savedEmergencyState?.isTriggered) {
+      emergencyStop.reset();
+      // Also reset consecutive losses so the bot gets a fresh chance
+      emergencyStop.fullReset();
+      log.info(
+        { botId },
+        "Emergency stop was previously triggered — full reset for fresh start"
+      );
+    }
+
     const circuitBreaker = new CircuitBreaker(botId, {
       maxPositionCount: botConfig.maxConcurrentPositions,
       maxPositionsPerPool: 1,
@@ -189,17 +213,18 @@ export class BotOrchestrator {
       try {
         const running = this.runningBots.get(botId);
         if (running) {
+          // Persist virtual balance before emergency shutdown
+          await this.persistVirtualBalance(botId);
           await running.engine.emergencyCloseAll();
           await running.engine.stop();
         }
-        db.update(bots)
+        await db.update(bots)
           .set({
             status: "error",
             lastError: `Emergency stop: ${reason}`,
-            updatedAt: new Date().toISOString(),
+            updatedAt: new Date(),
           })
-          .where(eq(bots.botId, botId))
-          .run();
+          .where(eq(bots.botId, botId));
         eventBus.emitBotEvent("engine:error", botId, userId, {
           error: `Emergency stop: ${reason}`,
           severity: "critical",
@@ -217,27 +242,53 @@ export class BotOrchestrator {
     let walletManager: WalletManager | undefined;
 
     if (isLiveMode) {
-      // LIVE MODE — real DLMM transactions
-      walletManager = new WalletManager(this.connection, {
-        maxExposureSOL: (botConfig.maxPositionSOL ?? 2) * botConfig.maxConcurrentPositions,
-      });
+      // LIVE MODE — Seal session-key execution
+      // The bot's agent + session keypairs are generated at setup-live time
+      // and stored (encrypted) in the DB. The session keypair signs all
+      // executeViaSession TXs — no user private key on the server.
 
-      // Load wallet from file or env
-      if (config.WALLET_PATH) {
-        walletManager.loadFromFile(config.WALLET_PATH);
-      } else if (config.WALLET_PRIVATE_KEY) {
-        walletManager.loadFromEnv("WALLET_PRIVATE_KEY");
-      } else {
+      // ── Verify Seal program exists on-chain ──
+      const { SEAL_PROGRAM_ID } = await import("../services/solana.js");
+      const programInfo = await this.connection.getAccountInfo(SEAL_PROGRAM_ID);
+      if (!programInfo) {
         throw new Error(
-          "Live mode requires WALLET_PATH or WALLET_PRIVATE_KEY environment variable"
+          `Seal wallet program (${SEAL_PROGRAM_ID.toBase58()}) not found on ${config.SOLANA_NETWORK}. ` +
+          `Deploy the Seal program to ${config.SOLANA_NETWORK} before starting live mode.`
         );
       }
 
-      walletManager.confirm(); // Safety gate — we explicitly confirm
+      if (!botRow.sessionSecretKey || !botRow.agentSecretKey) {
+        throw new Error(
+          "Live mode requires Seal agent + session setup. " +
+          "Complete the live setup flow in the app first."
+        );
+      }
 
-      executor = new LiveExecutor(
+      // Look up the user's main wallet address (to derive wallet PDA)
+      const [user] = await db
+        .select({
+          walletAddress: users.walletAddress,
+          sealWalletAddress: users.sealWalletAddress,
+        })
+        .from(users)
+        .where(eq(users.id, userId));
+
+      if (!user?.walletAddress) {
+        throw new Error("User wallet address not found");
+      }
+
+      const canonicalWalletAddress = user.sealWalletAddress ?? user.walletAddress;
+
+      const sealSession = SealSession.fromDb(
+        canonicalWalletAddress,
+        botRow.agentSecretKey,
+        botRow.sessionSecretKey,
+        this.connection
+      );
+
+      executor = new SealExecutor(
         this.connection,
-        walletManager,
+        sealSession,
         marketData,
         botConfig,
         emergencyStop,
@@ -245,17 +296,33 @@ export class BotOrchestrator {
       );
 
       log.warn(
-        { botId, wallet: walletManager.getPublicKey().toBase58().slice(0, 8) + "…" },
-        "LIVE executor created — REAL MONEY MODE"
+        {
+          botId,
+          walletPda: sealSession.getWalletPda().toBase58().slice(0, 8) + "…",
+          sessionPubkey: sealSession.sessionPubkey.toBase58().slice(0, 8) + "…",
+        },
+        "Sage live executor created — delegated wallet execution"
       );
     } else {
       // SIMULATION MODE — virtual balance, real market data
+      // Restore persisted balance if available (survives restarts / stops)
+      const restoredBalanceSol = botRow.currentVirtualBalanceLamports != null
+        ? botRow.currentVirtualBalanceLamports / LAMPORTS_PER_SOL
+        : botRow.simulationBalanceSOL;
+
       executor = new SimulationExecutor(
         botConfig,
         marketData,
-        botRow.simulationBalanceSOL
+        restoredBalanceSol
       );
-      log.info({ botId }, "Simulation executor created");
+      log.info(
+        {
+          botId,
+          balanceSol: restoredBalanceSol.toFixed(4),
+          restored: botRow.currentVirtualBalanceLamports != null,
+        },
+        "Simulation executor created"
+      );
     }
 
     // Create TradingEngine with event callback, ML predictor, and safety systems
@@ -293,6 +360,9 @@ export class BotOrchestrator {
 
   /**
    * Stop a bot gracefully. Engine stops scanning but doesn't close positions.
+   * Any active positions that were being tracked become orphans — they still
+   * exist on-chain but no bot is monitoring them. We mark them in the DB so
+   * the reconciliation endpoint (and the UI) can surface them.
    */
   async stopBot(botId: string): Promise<void> {
     // Prevent concurrent start/stop on the same bot
@@ -310,6 +380,24 @@ export class BotOrchestrator {
 
       // Persist EmergencyStop state before stopping
       this.persistEmergencyStopState(botId);
+
+      // Persist virtual balance before engine is destroyed
+      await this.persistVirtualBalance(botId);
+
+      // Mark any active positions as orphaned before removing the engine
+      const activePositions = running.engine.getActivePositions();
+      if (activePositions.length > 0) {
+        log.info(
+          { botId, count: activePositions.length },
+          "Marking active positions as orphaned before bot stop"
+        );
+        for (const pos of activePositions) {
+          await db
+            .update(positions)
+            .set({ status: "orphaned", updatedAt: new Date() })
+            .where(eq(positions.positionId, pos.id));
+        }
+      }
 
       await running.engine.stop();
       this.runningBots.delete(botId);
@@ -362,20 +450,44 @@ export class BotOrchestrator {
    * Persist EmergencyStop state to DB for a running bot.
    * Called after every trade result to survive restarts.
    */
-  private persistEmergencyStopState(botId: string): void {
+  private async persistEmergencyStopState(botId: string): Promise<void> {
     const running = this.runningBots.get(botId);
     if (!running) return;
 
     try {
       const stateJson = running.emergencyStop.serializeState();
-      db.update(bots)
+      await db.update(bots)
         .set({ emergencyStopState: stateJson })
-        .where(eq(bots.botId, botId))
-        .run();
+        .where(eq(bots.botId, botId));
     } catch (err) {
       log.error(
         { botId, err: err instanceof Error ? err.message : String(err) },
         "Failed to persist EmergencyStop state"
+      );
+    }
+  }
+
+  /**
+   * Persist the simulation executor's virtual balance to DB.
+   * Called on position open/close and bot stop so the balance
+   * survives restarts and is visible via API when the bot is stopped.
+   */
+  private async persistVirtualBalance(botId: string): Promise<void> {
+    const running = this.runningBots.get(botId);
+    if (!running) return;
+
+    try {
+      const balance = await running.executor.getBalance();
+      await db.update(bots)
+        .set({
+          currentVirtualBalanceLamports: balance.toNumber(),
+          updatedAt: new Date(),
+        })
+        .where(eq(bots.botId, botId));
+    } catch (err) {
+      log.error(
+        { botId, err: err instanceof Error ? err.message : String(err) },
+        "Failed to persist virtual balance"
       );
     }
   }
@@ -389,11 +501,10 @@ export class BotOrchestrator {
    * and restart them.
    */
   async recoverRunningBots(): Promise<number> {
-    const runningBots = db
+    const runningBots = await db
       .select()
       .from(bots)
-      .where(eq(bots.status, "running"))
-      .all();
+      .where(eq(bots.status, "running"));
 
     if (runningBots.length === 0) {
       log.info("No bots to recover");
@@ -420,14 +531,24 @@ export class BotOrchestrator {
         );
 
         // Mark as error in DB
-        db.update(bots)
+        await db.update(bots)
           .set({
             status: "error",
             lastError: `Recovery failed: ${error instanceof Error ? error.message : String(error)}`,
-            updatedAt: new Date().toISOString(),
+            updatedAt: new Date(),
           })
-          .where(eq(bots.botId, bot.botId))
-          .run();
+          .where(eq(bots.botId, bot.botId));
+
+        // Mark any active positions from this failed bot as orphaned
+        await db
+          .update(positions)
+          .set({ status: "orphaned", updatedAt: new Date() })
+          .where(
+            and(
+              eq(positions.botId, bot.botId),
+              eq(positions.status, "active")
+            )
+          );
       }
     }
 
@@ -566,15 +687,15 @@ export class BotOrchestrator {
 
   // ── Position Opened ──
 
-  private onPositionOpened(
+  private async onPositionOpened(
     botId: string,
     userId: number,
     position: TrackedPosition,
     score: MarketScore
-  ): void {
+  ): Promise<void> {
     try {
       // Insert into positions table
-      db.insert(positions)
+      await db.insert(positions)
         .values({
           positionId: position.id,
           botId,
@@ -585,6 +706,7 @@ export class BotOrchestrator {
           tokenXMint: position.tokenXMint,
           tokenYMint: position.tokenYMint,
           binStep: position.binStep,
+          onChainPositionKey: position.positionPubkey?.toBase58() ?? null,
           entryActiveBinId: position.entryActiveBinId,
           entryPricePerToken: position.entryPricePerToken,
           entryTimestamp: position.entryTimestamp,
@@ -599,11 +721,10 @@ export class BotOrchestrator {
           profitTargetPercent: position.profitTargetPercent,
           stopLossPercent: position.stopLossPercent,
           maxHoldTimeMinutes: position.maxHoldTimeMinutes,
-        })
-        .run();
+        });
 
       // Log to trade_log
-      db.insert(tradeLog)
+      await db.insert(tradeLog)
         .values({
           botId,
           userId,
@@ -616,17 +737,18 @@ export class BotOrchestrator {
             score: score.totalScore,
             amountY: position.entryAmountY.toString(),
           }),
-        })
-        .run();
+        });
 
       // Update bot activity
-      db.update(bots)
+      await db.update(bots)
         .set({
-          lastActivityAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
+          lastActivityAt: new Date(),
+          updatedAt: new Date(),
         })
-        .where(eq(bots.botId, botId))
-        .run();
+        .where(eq(bots.botId, botId));
+
+      // Persist virtual balance after deduction (simulation mode)
+      this.persistVirtualBalance(botId);
 
       // Emit event for WebSocket
       eventBus.emitBotEvent("position:opened", botId, userId, {
@@ -649,15 +771,15 @@ export class BotOrchestrator {
 
   // ── Position Closed ──
 
-  private onPositionClosed(
+  private async onPositionClosed(
     botId: string,
     userId: number,
     position: TrackedPosition,
     pnlLamports: BN
-  ): void {
+  ): Promise<void> {
     try {
       // Update position in DB
-      db.update(positions)
+      await db.update(positions)
         .set({
           status: "closed",
           exitPricePerToken: position.exitPricePerToken,
@@ -669,30 +791,28 @@ export class BotOrchestrator {
           txCostLamports:
             (position.entryTxCostLamports ?? 0) +
             (position.exitTxCostLamports ?? 0),
-          updatedAt: new Date().toISOString(),
+          updatedAt: new Date(),
         })
-        .where(eq(positions.positionId, position.id))
-        .run();
+        .where(eq(positions.positionId, position.id));
 
       // Update bot stats
       const isWin = pnlLamports.gtn(0);
-      const botRow = db.select().from(bots).where(eq(bots.botId, botId)).get();
+      const [botRow] = await db.select().from(bots).where(eq(bots.botId, botId));
       if (botRow) {
-        db.update(bots)
+        await db.update(bots)
           .set({
             totalTrades: botRow.totalTrades + 1,
             winningTrades: botRow.winningTrades + (isWin ? 1 : 0),
             totalPnlLamports:
               botRow.totalPnlLamports + pnlLamports.toNumber(),
-            lastActivityAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
+            lastActivityAt: new Date(),
+            updatedAt: new Date(),
           })
-          .where(eq(bots.botId, botId))
-          .run();
+          .where(eq(bots.botId, botId));
       }
 
       // Log to trade_log
-      db.insert(tradeLog)
+      await db.insert(tradeLog)
         .values({
           botId,
           userId,
@@ -706,8 +826,7 @@ export class BotOrchestrator {
             pnlSol: (pnlLamports.toNumber() / LAMPORTS_PER_SOL).toFixed(6),
             result: isWin ? "WIN" : "LOSS",
           }),
-        })
-        .run();
+        });
 
       // Emit event
       const pnlSol = pnlLamports.toNumber() / LAMPORTS_PER_SOL;
@@ -723,6 +842,9 @@ export class BotOrchestrator {
       // Persist EmergencyStop state after trade result is recorded
       // (the TradingEngine calls emergencyStop.recordTradeResult before emitting this event)
       this.persistEmergencyStopState(botId);
+
+      // Persist virtual balance after PnL credit (simulation mode)
+      this.persistVirtualBalance(botId);
     } catch (error) {
       log.error(
         {
@@ -737,11 +859,11 @@ export class BotOrchestrator {
 
   // ── Position Updated ──
 
-  private onPositionUpdated(
+  private async onPositionUpdated(
     botId: string,
     _userId: number,
     position: TrackedPosition
-  ): void {
+  ): Promise<void> {
     // Checkpoint position state to DB periodically.
     // These come from the 30s checkpoint interval in TradingEngine.
     // Persist current price + unrealized PnL so data survives server restarts.
@@ -754,14 +876,13 @@ export class BotOrchestrator {
         ? Math.round(((current - entryPrice) / entryPrice) * entryLamports)
         : 0;
 
-      db.update(positions)
+      await db.update(positions)
         .set({
           currentPricePerToken: currentPrice,
           unrealizedPnlLamports,
-          updatedAt: new Date().toISOString(),
+          updatedAt: new Date(),
         })
-        .where(eq(positions.positionId, position.id))
-        .run();
+        .where(eq(positions.positionId, position.id));
     } catch (error) {
       log.error(
         {
@@ -776,12 +897,12 @@ export class BotOrchestrator {
 
   // ── Scan Completed ──
 
-  private onScanCompleted(
+  private async onScanCompleted(
     botId: string,
     userId: number,
     eligible: number,
     entered: number
-  ): void {
+  ): Promise<void> {
     // Only emit events for scans that resulted in entries
     if (entered > 0) {
       eventBus.emitBotEvent("scan:completed", botId, userId, {
@@ -791,31 +912,29 @@ export class BotOrchestrator {
     }
 
     // Update activity timestamp
-    db.update(bots)
+    await db.update(bots)
       .set({
-        lastActivityAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
+        lastActivityAt: new Date(),
+        updatedAt: new Date(),
       })
-      .where(eq(bots.botId, botId))
-      .run();
+      .where(eq(bots.botId, botId));
   }
 
   // ── Engine Error ──
 
-  private onEngineError(
+  private async onEngineError(
     botId: string,
     userId: number,
     error: string
-  ): void {
+  ): Promise<void> {
     log.error({ botId, error }, "Engine error");
 
-    db.update(bots)
+    await db.update(bots)
       .set({
         lastError: error,
-        updatedAt: new Date().toISOString(),
+        updatedAt: new Date(),
       })
-      .where(eq(bots.botId, botId))
-      .run();
+      .where(eq(bots.botId, botId));
 
     eventBus.emitBotEvent("engine:error", botId, userId, { error });
   }
@@ -871,15 +990,15 @@ export class BotOrchestrator {
   /**
    * Fetch a bot row from DB.
    */
-  private getBotRow(
+  private async getBotRow(
     botId: string,
     userId: number
-  ): BotRow | undefined {
-    return db
+  ): Promise<BotRow | undefined> {
+    const [row] = await db
       .select()
       .from(bots)
-      .where(and(eq(bots.botId, botId), eq(bots.userId, userId)))
-      .get();
+      .where(and(eq(bots.botId, botId), eq(bots.userId, userId)));
+    return row;
   }
 
   /**

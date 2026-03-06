@@ -103,17 +103,18 @@ auth.post("/verify", zValidator("json", verifySchema), async (c) => {
       message
     );
     const tokens = await issueTokens(userId, walletAddress);
-    const user = db
+    const [user] = await db
       .select({
         id: users.id,
         walletAddress: users.walletAddress,
-        sentinelWalletAddress: users.sentinelWalletAddress,
+        sealWalletAddress: users.sealWalletAddress,
         displayName: users.displayName,
+        setupCompleted: users.setupCompleted,
+        execMode: users.execMode,
         createdAt: users.createdAt,
       })
       .from(users)
-      .where(eq(users.id, userId))
-      .get();
+      .where(eq(users.id, userId));
 
     return c.json({
       success: true,
@@ -148,29 +149,126 @@ auth.post("/refresh", zValidator("json", refreshSchema), async (c) => {
 });
 
 /**
+ * POST /auth/setup-complete
+ * Mark the authenticated user's setup as completed.
+ * Called once from the Flutter setup wizard — persists the flag server-side
+ * so it survives app reinstalls and works across devices.
+ */
+const setupCompleteSchema = z.object({
+  execMode: z
+    .enum(["simulation", "live"])
+    .describe("Chosen execution mode during setup"),
+});
+
+auth.post(
+  "/setup-complete",
+  requireAuth,
+  zValidator("json", setupCompleteSchema),
+  async (c) => {
+    const walletAddress = c.var.walletAddress;
+    const { execMode } = c.req.valid("json");
+
+    await db
+      .update(users)
+      .set({
+        setupCompleted: true,
+        execMode,
+        updatedAt: new Date(),
+      })
+      .where(eq(users.walletAddress, walletAddress));
+
+    return c.json({ success: true });
+  }
+);
+
+/**
  * GET /auth/me
  * Get current authenticated user info.
  */
 auth.get("/me", requireAuth, async (c) => {
   const walletAddress = c.var.walletAddress;
 
-  const user = db
+  const [user] = await db
     .select({
       id: users.id,
       walletAddress: users.walletAddress,
-      sentinelWalletAddress: users.sentinelWalletAddress,
+      sealWalletAddress: users.sealWalletAddress,
       displayName: users.displayName,
+      setupCompleted: users.setupCompleted,
+      execMode: users.execMode,
+      setupProgress: users.setupProgress,
       createdAt: users.createdAt,
     })
     .from(users)
-    .where(eq(users.walletAddress, walletAddress))
-    .get();
+    .where(eq(users.walletAddress, walletAddress));
 
   if (!user) {
     throw createApiError("User not found", 404);
   }
 
   return c.json({ success: true, user });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// PUT /auth/setup-progress — Save setup wizard progress (cloud-synced)
+// ═══════════════════════════════════════════════════════════════
+
+const setupProgressSchema = z.object({
+  step: z.number().int().min(0).max(2),
+  path: z.enum(["sage-ai", "custom"]).nullable().optional(),
+  execMode: z.enum(["simulation", "live"]).nullable().optional(),
+  useAiChat: z.boolean().optional(),
+  params: z.object({
+    entryScoreThreshold: z.number().optional(),
+    minVolume24h: z.number().optional(),
+    minLiquidity: z.number().optional(),
+    maxLiquidity: z.number().optional(),
+    positionSizeSOL: z.number().optional(),
+    maxConcurrentPositions: z.number().optional(),
+    defaultBinRange: z.number().optional(),
+    profitTargetPercent: z.number().optional(),
+    stopLossPercent: z.number().optional(),
+    maxHoldTimeMinutes: z.number().optional(),
+    maxDailyLossSOL: z.number().optional(),
+    cooldownMinutes: z.number().optional(),
+  }).nullable().optional(),
+});
+
+auth.put(
+  "/setup-progress",
+  requireAuth,
+  zValidator("json", setupProgressSchema),
+  async (c) => {
+    const walletAddress = c.var.walletAddress;
+    const progress = c.req.valid("json");
+
+    await db
+      .update(users)
+      .set({
+        setupProgress: progress,
+        updatedAt: new Date(),
+      })
+      .where(eq(users.walletAddress, walletAddress));
+
+    return c.json({ success: true });
+  }
+);
+
+/**
+ * DELETE /auth/setup-progress — Clear setup progress (on completion).
+ */
+auth.delete("/setup-progress", requireAuth, async (c) => {
+  const walletAddress = c.var.walletAddress;
+
+  await db
+    .update(users)
+    .set({
+      setupProgress: null,
+      updatedAt: new Date(),
+    })
+    .where(eq(users.walletAddress, walletAddress));
+
+  return c.json({ success: true });
 });
 
 export default auth;

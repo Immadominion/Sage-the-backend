@@ -351,8 +351,8 @@ export class EmergencyStop {
       const parsed = JSON.parse(json);
       // Validate essential fields exist
       if (typeof parsed.isTriggered !== "boolean" ||
-          typeof parsed.dailyPnlSOL !== "number" ||
-          typeof parsed.totalPnlSOL !== "number") {
+        typeof parsed.dailyPnlSOL !== "number" ||
+        typeof parsed.totalPnlSOL !== "number") {
         return null;
       }
       return parsed as EmergencyStopState;

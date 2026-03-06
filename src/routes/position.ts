@@ -12,12 +12,14 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import { eq, and, desc } from "drizzle-orm";
+import { PublicKey } from "@solana/web3.js";
 import db from "../db/index.js";
 import { positions } from "../db/schema.js";
 import { requireAuth, type AuthVariables } from "../middleware/auth.js";
 import { createApiError } from "../middleware/error.js";
 import { orchestrator } from "../engine/orchestrator.js";
 import { LAMPORTS_PER_SOL } from "../engine/types.js";
+import { getConnection } from "../services/solana.js";
 
 const app = new Hono<{ Variables: AuthVariables }>();
 
@@ -35,12 +37,11 @@ app.get("/active", async (c) => {
   const livePositions = orchestrator.getAllLivePositions(userId);
 
   // Also get persisted active positions from DB (for bots that may have stopped)
-  const dbActive = db
+  const dbActive = await db
     .select()
     .from(positions)
     .where(and(eq(positions.userId, userId), eq(positions.status, "active")))
-    .orderBy(desc(positions.entryTimestamp))
-    .all();
+    .orderBy(desc(positions.entryTimestamp));
 
   // Merge: prefer live data when available (has real-time price)
   const liveIds = new Set(livePositions.map((p) => p.id));
@@ -117,20 +118,19 @@ app.get("/history", async (c) => {
     conditions.push(eq(positions.botId, query.botId));
   }
 
-  const rows = db
+  const rows = await db
     .select()
     .from(positions)
     .where(and(...conditions))
     .orderBy(desc(positions.exitTimestamp))
     .limit(query.limit)
-    .offset(query.offset)
-    .all();
+    .offset(query.offset);
 
-  const totalCount = db
+  const allMatchingRows = await db
     .select({ count: positions.id })
     .from(positions)
-    .where(and(...conditions))
-    .all().length;
+    .where(and(...conditions));
+  const totalCount = allMatchingRows.length;
 
   return c.json({
     success: true,
@@ -154,12 +154,11 @@ app.get("/bot/:botId", async (c) => {
     throw createApiError("Invalid bot ID format", 400);
   }
 
-  const rows = db
+  const rows = await db
     .select()
     .from(positions)
     .where(and(eq(positions.userId, userId), eq(positions.botId, botId)))
-    .orderBy(desc(positions.entryTimestamp))
-    .all();
+    .orderBy(desc(positions.entryTimestamp));
 
   return c.json({
     success: true,
@@ -208,13 +207,12 @@ app.get("/:positionId", async (c) => {
   const livePos = livePositions.find((p) => p.id === positionId);
 
   // Get DB record
-  const row = db
+  const [row] = await db
     .select()
     .from(positions)
     .where(
       and(eq(positions.userId, userId), eq(positions.positionId, positionId))
-    )
-    .get();
+    );
 
   if (!row && !livePos) {
     throw createApiError("Position not found", 404);
@@ -229,19 +227,19 @@ app.get("/:positionId", async (c) => {
     // Live overrides
     ...(livePos
       ? {
-          status: "active",
-          currentPrice: livePos.currentPricePerToken ?? livePos.entryPricePerToken,
-          pnlPercent: calculatePnlPercent(
-            livePos.entryPricePerToken,
-            livePos.currentPricePerToken ?? livePos.entryPricePerToken
-          ),
-          holdTimeMinutes: (Date.now() - livePos.entryTimestamp) / (1000 * 60),
-          highWaterMarkPercent: livePos.highWaterMarkPercent,
-          feesEarnedYSol: livePos.feesEarnedY ? livePos.feesEarnedY.toNumber() / LAMPORTS_PER_SOL : 0,
-          entryFeatures: livePos.entryFeatures,
-          mlProbability: livePos.mlProbability,
-          source: "live",
-        }
+        status: "active",
+        currentPrice: livePos.currentPricePerToken ?? livePos.entryPricePerToken,
+        pnlPercent: calculatePnlPercent(
+          livePos.entryPricePerToken,
+          livePos.currentPricePerToken ?? livePos.entryPricePerToken
+        ),
+        holdTimeMinutes: (Date.now() - livePos.entryTimestamp) / (1000 * 60),
+        highWaterMarkPercent: livePos.highWaterMarkPercent,
+        feesEarnedYSol: livePos.feesEarnedY ? livePos.feesEarnedY.toNumber() / LAMPORTS_PER_SOL : 0,
+        entryFeatures: livePos.entryFeatures,
+        mlProbability: livePos.mlProbability,
+        source: "live",
+      }
       : { source: "db" }),
   };
 
@@ -305,5 +303,150 @@ function calculatePnlPercent(
   if (entry === 0 || isNaN(entry) || isNaN(current)) return 0;
   return ((current - entry) / entry) * 100;
 }
+
+// ═══════════════════════════════════════════════════════════════
+// POST /position/reconcile — Compare DB positions vs on-chain state
+//
+// Finds active positions whose on-chain account has been closed
+// (e.g. the app crashed mid-close, or the user closed via a
+// different wallet tool). Marks them as resolved so they don't
+// show as phantom open positions forever.
+// ═══════════════════════════════════════════════════════════════
+
+app.post("/reconcile", async (c) => {
+  const userId = c.get("userId") as number;
+
+  // 1. Fetch all "active" positions for this user that have an on-chain key
+  const activeRows = await db
+    .select()
+    .from(positions)
+    .where(
+      and(
+        eq(positions.userId, userId),
+        eq(positions.status, "active")
+      )
+    );
+
+  if (activeRows.length === 0) {
+    return c.json({ success: true, reconciled: 0, orphaned: 0, details: [] });
+  }
+
+  const connection = getConnection();
+  const details: Array<{
+    positionId: string;
+    poolName: string;
+    action: "closed" | "orphaned" | "ok";
+  }> = [];
+
+  let reconciledCount = 0;
+  let orphanedCount = 0;
+
+  // 2. Check which positions have on-chain keys we can verify
+  const withOnChainKey = activeRows.filter((r) => r.onChainPositionKey);
+  const withoutOnChainKey = activeRows.filter((r) => !r.onChainPositionKey);
+
+  // 3. Batch-fetch account info for all on-chain keys (efficient RPC call)
+  if (withOnChainKey.length > 0) {
+    const pubkeys = withOnChainKey.map(
+      (r) => new PublicKey(r.onChainPositionKey!)
+    );
+
+    const accounts = await connection.getMultipleAccountsInfo(pubkeys);
+
+    for (let i = 0; i < withOnChainKey.length; i++) {
+      const row = withOnChainKey[i];
+      const accountInfo = accounts[i];
+
+      if (!accountInfo) {
+        // Account doesn't exist on-chain — position was closed outside our tracking
+        await db
+          .update(positions)
+          .set({
+            status: "closed",
+            exitTimestamp: Date.now(),
+            exitReason: "RECONCILED_MISSING",
+            updatedAt: new Date(),
+          })
+          .where(eq(positions.positionId, row.positionId));
+
+        reconciledCount++;
+        details.push({
+          positionId: row.positionId,
+          poolName: row.poolName,
+          action: "closed",
+        });
+      } else {
+        // Account exists on-chain — check if a bot is actively tracking it
+        const isTracked = orchestrator
+          .getAllLivePositions(userId)
+          .some((p) => p.id === row.positionId);
+
+        if (!isTracked) {
+          // On-chain but no bot watching it → orphaned
+          await db
+            .update(positions)
+            .set({
+              status: "orphaned",
+              updatedAt: new Date(),
+            })
+            .where(eq(positions.positionId, row.positionId));
+
+          orphanedCount++;
+          details.push({
+            positionId: row.positionId,
+            poolName: row.poolName,
+            action: "orphaned",
+          });
+        } else {
+          details.push({
+            positionId: row.positionId,
+            poolName: row.poolName,
+            action: "ok",
+          });
+        }
+      }
+    }
+  }
+
+  // 4. Positions without on-chain key — check if bot is tracking
+  for (const row of withoutOnChainKey) {
+    const isTracked = orchestrator
+      .getAllLivePositions(userId)
+      .some((p) => p.id === row.positionId);
+
+    if (!isTracked) {
+      // No on-chain key and no bot tracking → likely a simulation position
+      // that got stuck. Mark orphaned.
+      await db
+        .update(positions)
+        .set({
+          status: "orphaned",
+          updatedAt: new Date(),
+        })
+        .where(eq(positions.positionId, row.positionId));
+
+      orphanedCount++;
+      details.push({
+        positionId: row.positionId,
+        poolName: row.poolName,
+        action: "orphaned",
+      });
+    } else {
+      details.push({
+        positionId: row.positionId,
+        poolName: row.poolName,
+        action: "ok",
+      });
+    }
+  }
+
+  return c.json({
+    success: true,
+    reconciled: reconciledCount,
+    orphaned: orphanedCount,
+    total: activeRows.length,
+    details,
+  });
+});
 
 export default app;

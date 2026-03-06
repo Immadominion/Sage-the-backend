@@ -1,0 +1,1 @@
+ALTER TABLE "bots" ADD COLUMN "current_virtual_balance_lamports" bigint;

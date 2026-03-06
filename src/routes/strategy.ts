@@ -46,13 +46,12 @@ const createPresetSchema = z.object({
 strategy.get("/presets", requireAuth, async (c) => {
   const userId = c.var.userId;
 
-  const presets = db
+  const presets = await db
     .select()
     .from(strategyPresets)
     .where(
       or(eq(strategyPresets.isSystem, true), eq(strategyPresets.userId, userId))
-    )
-    .all();
+    );
 
   return c.json({ success: true, presets });
 });
@@ -70,23 +69,21 @@ strategy.post(
     const body = c.req.valid("json");
 
     // Limit custom presets per user
-    const existing = db
+    const [existing] = await db
       .select({ count: sql<number>`count(*)` })
       .from(strategyPresets)
-      .where(eq(strategyPresets.userId, userId))
-      .get();
+      .where(eq(strategyPresets.userId, userId));
 
     if (existing && existing.count >= 20) {
       throw createApiError("Maximum 20 custom presets per user", 400);
     }
 
-    db.insert(strategyPresets)
+    await db.insert(strategyPresets)
       .values({
         userId,
         isSystem: false,
         ...body,
-      })
-      .run();
+      });
 
     return c.json({ success: true }, 201);
   }
