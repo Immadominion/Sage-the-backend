@@ -1,11 +1,9 @@
 /**
  * Seal wallet routes — proxy to on-chain wallet operations.
  *
- * These endpoints prepare unsigned (or sponsor-signed) transactions
- * that the Flutter app signs via MWA (Mobile Wallet Adapter) and submits.
- *
- * Sponsored mode: When Turnkey sponsor is configured, wallet creation
- * is paid by the sponsor wallet — the user only signs to prove ownership.
+ * These endpoints prepare unsigned transactions that the Flutter app
+ * signs via MWA (Mobile Wallet Adapter) and submits. The user always
+ * pays for rent and transaction fees.
  */
 
 import { Hono } from "hono";
@@ -31,17 +29,14 @@ import {
   SEAL_PROGRAM_ID,
   withRpcRetry,
 } from "../services/solana.js";
-import {
-  isSponsorAvailable,
-  getSponsorInfo,
-  sponsorSign,
-} from "../services/sponsor.js";
+import { TransactionSender } from "../engine/transaction-sender.js";
+// Sponsor wallet removed — users pay for their own transactions.
 import { requireAuth, type AuthVariables } from "../middleware/auth.js";
 import { createApiError } from "../middleware/error.js";
 import config from "../config.js";
 import db from "../db/index.js";
 import { users, bots } from "../db/schema.js";
-import { eq, and } from "drizzle-orm";
+import { eq, and, isNotNull } from "drizzle-orm";
 
 const wallet = new Hono<{ Variables: AuthVariables }>();
 
@@ -305,9 +300,7 @@ function buildCreateWalletIx(
 
 /**
  * POST /wallet/prepare-create
- * Prepare TX for Seal wallet creation.
- * When Turnkey sponsor is configured, the TX is partially signed by
- * the sponsor (user pays nothing). Otherwise, the user pays.
+ * Prepare TX for Seal wallet creation. User pays rent + fees.
  */
 wallet.post(
   "/prepare-create",
@@ -338,13 +331,8 @@ wallet.post(
       Math.floor(body.perTxLimitSol * LAMPORTS_PER_SOL)
     );
 
-    const sponsored = await isSponsorAvailable();
-    const funderPubkey = sponsored
-      ? (await getSponsorInfo()).publicKey
-      : ownerPubkey;
-
     const ix = buildCreateWalletIx(
-      funderPubkey,
+      ownerPubkey,
       ownerPubkey,
       walletPda,
       bump,
@@ -358,13 +346,7 @@ wallet.post(
     const tx = new Transaction();
     tx.add(ix);
     tx.recentBlockhash = blockhash;
-    tx.feePayer = funderPubkey;
-
-    // If sponsor is available, partially sign so the user only
-    // needs to add their MWA signature.
-    if (sponsored) {
-      await sponsorSign(tx);
-    }
+    tx.feePayer = ownerPubkey;
 
     const serialized = tx
       .serialize({ requireAllSignatures: false })
@@ -379,7 +361,7 @@ wallet.post(
       success: true,
       walletAddress: walletPda.toBase58(),
       transaction: serialized,
-      sponsored,
+      sponsored: false,
       network: config.SOLANA_NETWORK,
       blockhash,
       lastValidBlockHeight,
@@ -429,20 +411,47 @@ wallet.get("/balance", requireAuth, async (c) => {
   const walletPda = await getCanonicalWalletPda(userId, ownerPubkey);
 
   const connection = getConnection();
-  const lamports = await connection.getBalance(walletPda);
+  const walletLamports = await connection.getBalance(walletPda);
+
+  // Include session signer balances — older deposits may have been
+  // routed to session signers before the TransferLamports upgrade.
+  // New deposits go to the wallet PDA; the backend pre-funds the 
+  // session signer on-demand via TransferLamports before each trade.
+  let sessionLamports = 0;
+  try {
+    const sessionRows = await db
+      .select({ sessionPubkey: bots.sessionPubkey })
+      .from(bots)
+      .where(and(
+        eq(bots.userId, userId),
+        eq(bots.mode, "live"),
+        isNotNull(bots.sessionPubkey),
+      ));
+    const seen = new Set<string>();
+    for (const row of sessionRows) {
+      if (!row.sessionPubkey || seen.has(row.sessionPubkey)) continue;
+      seen.add(row.sessionPubkey);
+      try {
+        sessionLamports += await connection.getBalance(new PublicKey(row.sessionPubkey));
+      } catch { /* skip invalid keys */ }
+    }
+  } catch { /* ignore */ }
+
+  const totalLamports = walletLamports + sessionLamports;
 
   return c.json({
     success: true,
-    lamports,
-    sol: lamports / LAMPORTS_PER_SOL,
+    lamports: totalLamports,
+    sol: totalLamports / LAMPORTS_PER_SOL,
+    walletLamports,
+    sessionLamports,
   });
 });
 
 /**
  * POST /wallet/prepare-create-and-fund
  * Prepare a TX that creates a Seal wallet AND transfers SOL into it.
- * Wallet creation rent is sponsored (when Turnkey is configured).
- * The SOL deposit always comes from the user.
+ * User pays for everything (rent + deposit + fees).
  */
 wallet.post(
   "/prepare-create-and-fund",
@@ -476,14 +485,9 @@ wallet.post(
       Math.floor(body.depositSol * LAMPORTS_PER_SOL)
     );
 
-    const sponsored = await isSponsorAvailable();
-    const funderPubkey = sponsored
-      ? (await getSponsorInfo()).publicKey
-      : ownerPubkey;
-
-    // Instruction 1: Create wallet PDA (sponsor pays rent if available)
+    // Instruction 1: Create wallet PDA
     const createIx = buildCreateWalletIx(
-      funderPubkey,
+      ownerPubkey,
       ownerPubkey,
       walletPda,
       bump,
@@ -491,7 +495,7 @@ wallet.post(
       perTxLimitLamports
     );
 
-    // Instruction 2: Transfer SOL from user → wallet PDA (user always pays deposit)
+    // Instruction 2: Transfer SOL from user → wallet PDA
     const transferIx = SystemProgram.transfer({
       fromPubkey: ownerPubkey,
       toPubkey: walletPda,
@@ -505,12 +509,7 @@ wallet.post(
     tx.add(createIx);
     tx.add(transferIx);
     tx.recentBlockhash = blockhash;
-    // Fee payer is sponsor when available, otherwise the user
-    tx.feePayer = funderPubkey;
-
-    if (sponsored) {
-      await sponsorSign(tx);
-    }
+    tx.feePayer = ownerPubkey;
 
     const serialized = tx
       .serialize({ requireAllSignatures: false })
@@ -525,7 +524,7 @@ wallet.post(
       success: true,
       walletAddress: walletPda.toBase58(),
       transaction: serialized,
-      sponsored,
+      sponsored: false,
       depositSol: body.depositSol,
       network: config.SOLANA_NETWORK,
       blockhash,
@@ -567,9 +566,17 @@ wallet.post(
       Math.floor(body.amountSol * LAMPORTS_PER_SOL)
     );
 
+    // ── Deposit goes to wallet PDA ──
+    // Funds are always deposited to the Seal wallet PDA (the user's
+    // non-custodial smart wallet). Before opening trades, the backend
+    // uses the Seal program's TransferLamports instruction to pre-fund
+    // the session signer from the wallet PDA on-demand.
+    const depositTarget = walletPda;
+    const depositTargetLabel = "wallet_pda";
+
     const transferIx = SystemProgram.transfer({
       fromPubkey: ownerPubkey,
-      toPubkey: walletPda,
+      toPubkey: depositTarget,
       lamports: depositLamports,
     });
 
@@ -578,6 +585,7 @@ wallet.post(
 
     const tx = new Transaction();
     tx.add(transferIx);
+
     tx.recentBlockhash = blockhash;
     tx.feePayer = ownerPubkey;
 
@@ -590,6 +598,7 @@ wallet.post(
       walletAddress: walletPda.toBase58(),
       transaction: serialized,
       depositSol: body.amountSol,
+      depositTarget: depositTargetLabel,
       blockhash,
       lastValidBlockHeight,
     });
@@ -598,18 +607,14 @@ wallet.post(
 
 /**
  * GET /wallet/sponsor-status
- * Check if sponsored wallet creation is available.
- * The Flutter app uses this to decide whether to show "Free wallet"
- * or "You'll pay ~0.003 SOL" in the UI.
+ * Always returns sponsored: false. Sponsor wallet removed.
  */
 wallet.get("/sponsor-status", requireAuth, async (c) => {
-  const available = await isSponsorAvailable();
-  const info = available ? await getSponsorInfo() : null;
   return c.json({
     success: true,
-    sponsored: available,
-    sponsor: info?.address ?? null,
-    strategy: info?.strategy ?? null,
+    sponsored: false,
+    sponsor: null,
+    strategy: null,
   });
 });
 
@@ -752,6 +757,127 @@ function buildCreateSessionIx(
   };
 }
 
+async function finalizeLiveSession(opts: {
+  botId: string;
+  userId: number;
+  walletPda: PublicKey;
+  durationSecs: number;
+  maxAmountSol: number;
+  maxPerTxSol: number;
+}): Promise<{
+  sessionAddress: string;
+  sessionPubkey: string;
+  signature: string;
+}> {
+  const connection = getConnection();
+
+  const [bot] = await db
+    .select()
+    .from(bots)
+    .where(and(eq(bots.botId, opts.botId), eq(bots.userId, opts.userId)));
+
+  if (!bot?.agentPubkey || !bot.agentSecretKey || !bot.sessionPubkey || !bot.sessionSecretKey) {
+    throw createApiError("Live setup keys are missing. Retry setup.", 409);
+  }
+
+  const agentPubkey = new PublicKey(bot.agentPubkey);
+  const sessionPubkey = new PublicKey(bot.sessionPubkey);
+  const agentKeypair = Keypair.fromSecretKey(
+    Buffer.from(bot.agentSecretKey, "base64")
+  );
+  const sessionKeypair = Keypair.fromSecretKey(
+    Buffer.from(bot.sessionSecretKey, "base64")
+  );
+
+  const [agentPda] = deriveAgentPda(opts.walletPda, agentPubkey);
+  const [sessionPda, sessionBump] = deriveSessionPda(
+    opts.walletPda,
+    agentPubkey,
+    sessionPubkey
+  );
+
+  const [agentAccount, sessionAccount] = await Promise.all([
+    withRpcRetry(() => connection.getAccountInfo(agentPda)),
+    withRpcRetry(() => connection.getAccountInfo(sessionPda)),
+  ]);
+
+  if (!agentAccount) {
+    throw createApiError(
+      "Live setup is incomplete. Owner approval did not register the wallet signer.",
+      409
+    );
+  }
+
+  if (sessionAccount) {
+    return {
+      sessionAddress: sessionPda.toBase58(),
+      sessionPubkey: sessionPubkey.toBase58(),
+      signature: "already-created",
+    };
+  }
+
+  const createSessionIx = buildCreateSessionIx(
+    agentPubkey,
+    opts.walletPda,
+    agentPda,
+    sessionPda,
+    sessionBump,
+    sessionPubkey,
+    BigInt(opts.durationSecs),
+    BigInt(Math.floor(opts.maxAmountSol * LAMPORTS_PER_SOL)),
+    BigInt(Math.floor(opts.maxPerTxSol * LAMPORTS_PER_SOL))
+  );
+
+  const sessionRentLamports = await withRpcRetry(() =>
+    connection.getMinimumBalanceForRentExemption(154) // SessionKey::SIZE
+  );
+  const signerRentLamports = await withRpcRetry(() =>
+    connection.getMinimumBalanceForRentExemption(0)
+  );
+  const requiredAgentLamports = sessionRentLamports + signerRentLamports + 500_000;
+  const agentBalanceLamports = await withRpcRetry(() =>
+    connection.getBalance(agentPubkey)
+  );
+
+  const tx = new Transaction();
+  tx.feePayer = sessionKeypair.publicKey;
+
+  if (agentBalanceLamports < requiredAgentLamports) {
+    tx.add(SystemProgram.transfer({
+      fromPubkey: sessionKeypair.publicKey,
+      toPubkey: agentPubkey,
+      lamports: requiredAgentLamports - agentBalanceLamports,
+    }));
+  }
+
+  tx.add(createSessionIx);
+
+  const txSender = new TransactionSender(connection);
+  const txWithFees = txSender.addPriorityFee(tx);
+  const result = await txSender.sendTransaction(txWithFees, [sessionKeypair, agentKeypair]);
+
+  if (!result.success || !result.signature) {
+    throw createApiError(
+      `Failed to finalize live setup: ${result.error ?? "unknown error"}`,
+      500
+    );
+  }
+
+  await db.update(bots)
+    .set({
+      agentConfigAddress: agentPda.toBase58(),
+      sessionAddress: sessionPda.toBase58(),
+      updatedAt: new Date(),
+    })
+    .where(eq(bots.botId, opts.botId));
+
+  return {
+    sessionAddress: sessionPda.toBase58(),
+    sessionPubkey: sessionPubkey.toBase58(),
+    signature: result.signature,
+  };
+}
+
 /**
  * Build a RevokeSession instruction (discriminant = 4).
  *
@@ -781,6 +907,33 @@ function buildRevokeSessionIx(
   };
 }
 
+function buildDeregisterAgentIx(
+  owner: PublicKey,
+  walletPda: PublicKey,
+  agentPda: PublicKey
+) {
+  return {
+    programId: SEAL_PROGRAM_ID,
+    keys: [
+      { pubkey: owner, isSigner: true, isWritable: true },
+      { pubkey: walletPda, isSigner: false, isWritable: true },
+      { pubkey: agentPda, isSigner: false, isWritable: true },
+    ],
+    data: Buffer.from([8]), // DeregisterAgent
+  };
+}
+
+function buildCloseWalletIx(owner: PublicKey, walletPda: PublicKey) {
+  return {
+    programId: SEAL_PROGRAM_ID,
+    keys: [
+      { pubkey: owner, isSigner: true, isWritable: true },
+      { pubkey: walletPda, isSigner: false, isWritable: true },
+    ],
+    data: Buffer.from([9]), // CloseWallet
+  };
+}
+
 /**
  * POST /wallet/prepare-register-agent
  * Prepare TX to register a bot as a Seal agent on the user's wallet.
@@ -789,9 +942,8 @@ function buildRevokeSessionIx(
  * 1. Validate the bot exists, belongs to the user, and is live mode
  * 2. Derive the AgentConfig PDA
  * 3. Build the RegisterAgent instruction
- * 4. Optionally sponsor-sign
- * 5. Return serialized TX for MWA signing
- * 6. Store agentPubkey + agentConfigAddress in the bot row
+ * 4. Return serialized TX for MWA signing
+ * 5. Store agentPubkey + agentConfigAddress in the bot row
  */
 wallet.post(
   "/prepare-register-agent",
@@ -864,10 +1016,8 @@ wallet.post(
       Math.floor(body.perTxLimitSol * LAMPORTS_PER_SOL)
     );
 
-    const sponsored = await isSponsorAvailable();
-    const funderPubkey = sponsored
-      ? (await getSponsorInfo()).publicKey
-      : ownerPubkey;
+    const sponsored = false;
+    const funderPubkey = ownerPubkey;
 
     const ix = buildRegisterAgentIx(
       ownerPubkey,
@@ -889,10 +1039,6 @@ wallet.post(
     tx.add(ix);
     tx.recentBlockhash = blockhash;
     tx.feePayer = funderPubkey;
-
-    if (sponsored) {
-      await sponsorSign(tx);
-    }
 
     const serialized = tx
       .serialize({ requireAllSignatures: false })
@@ -1109,6 +1255,8 @@ const setupLiveSchema = z.object({
   /** Agent spending limits */
   dailyLimitSol: z.number().positive().max(1000).default(10),
   perTxLimitSol: z.number().positive().max(100).default(2),
+  /** Trading capital — goes directly to session signer */
+  depositSol: z.number().nonnegative().max(1000).default(0),
   /** Session config */
   sessionDurationSecs: z.number().int().positive().default(7 * 24 * 60 * 60), // 7 days
   sessionMaxAmountSol: z.number().positive().default(100),
@@ -1118,22 +1266,15 @@ const setupLiveSchema = z.object({
 
 /**
  * POST /wallet/setup-live
- * One-shot live mode setup: generates agent + session keypairs SERVER-SIDE,
- * builds RegisterAgent + CreateSession in a single TX.
+ * Prepare the owner-signed phase of live setup.
  *
- * The backend signs with the agent keypair. Flutter signs with the owner
- * via MWA. One MWA popup → agent + session both created atomically.
+ * The wallet-facing transaction is owner-only:
+ * 1. fund agent signer
+ * 2. fund session signer
+ * 3. register agent
  *
- * Flow:
- * 1. Validate bot exists, belongs to user, is live mode, no agent yet
- * 2. Generate agent keypair + session keypair (server-side)
- * 3. Store private keys in DB (encrypted in production)
- * 4. Build RegisterAgent IX (owner signs) + CreateSession IX (agent signs)
- * 5. Combine in one TX, agent-sign server-side
- * 6. Return partially-signed TX for MWA signing
- *
- * After MWA signing + submission, the bot has an active session key
- * and the orchestrator can use it to sign executeViaSession trades.
+ * After the owner-signed transaction is submitted, the backend finalizes
+ * `CreateSession` separately using the stored agent keypair.
  */
 wallet.post(
   "/setup-live",
@@ -1146,6 +1287,14 @@ wallet.post(
 
     const ownerPubkey = new PublicKey(ownerAddress);
     const allowedPrograms = resolveAgentAllowedPrograms(body.allowedPrograms);
+    const effectiveSessionMaxAmountSol = Math.min(
+      body.sessionMaxAmountSol,
+      body.dailyLimitSol,
+    );
+    const effectiveSessionMaxPerTxSol = Math.min(
+      body.sessionMaxPerTxSol,
+      body.perTxLimitSol,
+    );
 
     // ── Validate bot ──
     const [bot] = await db
@@ -1164,48 +1313,150 @@ wallet.post(
       );
     }
 
-    if (bot.agentPubkey && bot.sessionAddress) {
-      throw createApiError("Bot already has agent + session configured", 409, {
-        agentPubkey: bot.agentPubkey,
-        sessionAddress: bot.sessionAddress,
-      });
-    }
-
-    // ── Verify Seal wallet exists on-chain ──
-    const walletPda = await getCanonicalWalletPda(userId, ownerPubkey);
+    // ── Derive wallet PDA & check if it exists on-chain ──
+    // If wallet doesn't exist, we create it in the SAME transaction
+    // to avoid requiring a separate MWA signature.
+    const [walletPda, walletBump] = deriveWalletPda(ownerPubkey);
     const connection = getConnection();
     const walletAccount = await withRpcRetry(() =>
       connection.getAccountInfo(walletPda)
     );
-    if (!walletAccount) {
+    const needsWalletCreation = !walletAccount;
+
+    // Store wallet address in DB if not already set
+    const [currentUser] = await db
+      .select({ sealWalletAddress: users.sealWalletAddress })
+      .from(users)
+      .where(eq(users.id, userId));
+    if (!currentUser?.sealWalletAddress) {
+      await db.update(users)
+        .set({ sealWalletAddress: walletPda.toBase58() })
+        .where(eq(users.id, userId));
+    }
+
+    // ── Calculate session funding ──
+    // The session signer pays for ALL on-chain costs: position rent,
+    // ATA creation, SOL wrapping, TX fees. The user's deposit goes
+    // directly here — no separate deposit step needed.
+    const POSITION_RENT_ESTIMATE = 60_000_000;  // 0.06 SOL
+    const TX_FEE_BUFFER = 10_000_000;           // 0.01 SOL
+    const FINALIZATION_BUFFER = 5_000_000;       // 0.005 SOL (CreateSession TX fee)
+    const positionLamports = Math.floor(body.perTxLimitSol * LAMPORTS_PER_SOL);
+    const minSessionFunding = positionLamports + POSITION_RENT_ESTIMATE + TX_FEE_BUFFER + FINALIZATION_BUFFER;
+    const depositLamports = body.depositSol > 0
+      ? Math.floor(body.depositSol * LAMPORTS_PER_SOL)
+      : minSessionFunding;
+
+    if (depositLamports < minSessionFunding) {
+      const minSol = (minSessionFunding / LAMPORTS_PER_SOL).toFixed(3);
       throw createApiError(
-        "Seal wallet not found. Create one first.",
-        404
+        `Minimum deposit is ${minSol} SOL for a ${body.perTxLimitSol} SOL position size (covers rent + fees).`,
+        400
       );
     }
 
-    // ── Generate keypairs server-side ──
-    const agentKeypair = Keypair.generate();
-    const sessionKeypair = Keypair.generate();
+    // ── Handle retry: keys in DB but TX was never signed (user cancelled MWA) ──
+    let agentKeypair: Keypair;
+    let sessionKeypair: Keypair;
+
+    if (bot.agentPubkey && bot.sessionAddress && bot.agentSecretKey && bot.sessionSecretKey) {
+      // Keys exist in DB — check if accounts exist on-chain
+      const existingAgentPubkey = new PublicKey(bot.agentPubkey);
+      const existingSessionPubkey = new PublicKey(bot.sessionPubkey!);
+      const [existingAgentPda] = deriveAgentPda(walletPda, existingAgentPubkey);
+      const [existingSessionPda] = deriveSessionPda(walletPda, existingAgentPubkey, existingSessionPubkey);
+
+      const [onChainAgent, onChainSession] = await Promise.all([
+        withRpcRetry(() => connection.getAccountInfo(existingAgentPda)),
+        withRpcRetry(() => connection.getAccountInfo(existingSessionPda)),
+      ]);
+
+      if (onChainAgent && onChainSession) {
+        // Both exist on-chain — setup truly complete, this is a real 409
+        throw createApiError("Bot already has agent + session configured and confirmed on-chain", 409, {
+          agentPubkey: bot.agentPubkey,
+          sessionAddress: bot.sessionAddress,
+        });
+      }
+
+      if (onChainAgent && !onChainSession) {
+        const finalized = await finalizeLiveSession({
+          botId: body.botId,
+          userId,
+          walletPda,
+          durationSecs: body.sessionDurationSecs,
+          maxAmountSol: effectiveSessionMaxAmountSol,
+          maxPerTxSol: effectiveSessionMaxPerTxSol,
+        });
+
+        return c.json({
+          success: true,
+          botId: body.botId,
+          agentPubkey: bot.agentPubkey,
+          agentConfigAddress: bot.agentConfigAddress,
+          sessionAddress: finalized.sessionAddress,
+          sessionPubkey: finalized.sessionPubkey,
+          finalized: true,
+          finalizeSignature: finalized.signature,
+          network: config.SOLANA_NETWORK,
+        });
+      }
+
+      // Accounts NOT on-chain — user cancelled MWA. Reconstruct keypairs
+      // from stored secrets and rebuild TX so they can sign again.
+      console.log(
+        `[setup-live] Bot ${body.botId}: keys in DB but not on-chain — rebuilding TX for retry`
+      );
+      agentKeypair = Keypair.fromSecretKey(
+        Buffer.from(bot.agentSecretKey, "base64")
+      );
+      sessionKeypair = Keypair.fromSecretKey(
+        Buffer.from(bot.sessionSecretKey, "base64")
+      );
+    } else {
+      // ── Generate fresh keypairs server-side ──
+      agentKeypair = Keypair.generate();
+      sessionKeypair = Keypair.generate();
+    }
 
     // ── Derive PDAs ──
     const [agentPda, agentBump] = deriveAgentPda(walletPda, agentKeypair.publicKey);
-    const [sessionPda, sessionBump] = deriveSessionPda(
+    const [sessionPda] = deriveSessionPda(
       walletPda,
       agentKeypair.publicKey,
       sessionKeypair.publicKey
     );
 
-    // Verify neither PDA exists on-chain
+    // Verify neither PDA exists on-chain (safety check for fresh keys too)
     const [existingAgent, existingSession] = await Promise.all([
       withRpcRetry(() => connection.getAccountInfo(agentPda)),
       withRpcRetry(() => connection.getAccountInfo(sessionPda)),
     ]);
-    if (existingAgent) {
-      throw createApiError("Agent account already exists on-chain", 409);
+    if (existingAgent && existingSession) {
+      throw createApiError("Agent + session accounts already exist on-chain", 409);
     }
-    if (existingSession) {
-      throw createApiError("Session account already exists on-chain", 409);
+
+    if (existingAgent && !existingSession) {
+      const finalized = await finalizeLiveSession({
+        botId: body.botId,
+        userId,
+        walletPda,
+        durationSecs: body.sessionDurationSecs,
+        maxAmountSol: effectiveSessionMaxAmountSol,
+        maxPerTxSol: effectiveSessionMaxPerTxSol,
+      });
+
+      return c.json({
+        success: true,
+        botId: body.botId,
+        agentPubkey: agentKeypair.publicKey.toBase58(),
+        agentConfigAddress: agentPda.toBase58(),
+        sessionAddress: finalized.sessionAddress,
+        sessionPubkey: finalized.sessionPubkey,
+        finalized: true,
+        finalizeSignature: finalized.signature,
+        network: config.SOLANA_NETWORK,
+      });
     }
 
     // ── Build RegisterAgent IX ──
@@ -1228,91 +1479,65 @@ wallet.post(
       allowedPrograms
     );
 
-    // ── Build CreateSession IX ──
-    const sessionDurationSecs = BigInt(body.sessionDurationSecs);
-    const sessionMaxAmountLamports = BigInt(
-      Math.floor(body.sessionMaxAmountSol * LAMPORTS_PER_SOL)
-    );
-    const sessionMaxPerTxLamports = BigInt(
-      Math.floor(body.sessionMaxPerTxSol * LAMPORTS_PER_SOL)
-    );
-
-    const createSessionIx = buildCreateSessionIx(
-      agentKeypair.publicKey,
-      walletPda,
-      agentPda,
-      sessionPda,
-      sessionBump,
-      sessionKeypair.publicKey,
-      sessionDurationSecs,
-      sessionMaxAmountLamports,
-      sessionMaxPerTxLamports
-    );
-
     // ── Assemble TX ──
     const { blockhash, lastValidBlockHeight } = await withRpcRetry(() =>
       connection.getLatestBlockhash()
     );
+    const funderPubkey = ownerPubkey;
 
-    // Determine fee payer: prefer sponsor if available AND funded,
-    // otherwise the owner pays (they sign via MWA anyway).
-    let sponsored = await isSponsorAvailable();
-    let funderPubkey = ownerPubkey;
+    const tx = new Transaction();
 
-    if (sponsored) {
-      const sponsorInfo = await getSponsorInfo();
-      const sponsorBalance = await withRpcRetry(() =>
-        connection.getBalance(sponsorInfo.publicKey)
-      );
-      // Need enough for: TX fees (~15k) + agent funding (~102k) = ~120k total
-      const MIN_SPONSOR_BALANCE = 50_000_000; // 0.05 SOL (safety margin for multiple ops)
-      if (sponsorBalance >= MIN_SPONSOR_BALANCE) {
-        funderPubkey = sponsorInfo.publicKey;
-      } else {
-        // Sponsor exists but not funded on this network — fall back to owner
-        sponsored = false;
-        funderPubkey = ownerPubkey;
-        console.warn(
-          `⚠️  Sponsor balance (${sponsorBalance} lamports) below minimum ` +
-          `(${MIN_SPONSOR_BALANCE}) on ${config.SOLANA_NETWORK}. Owner will pay setup costs.`
-        );
-      }
+    // 0. Create wallet PDA if it doesn't exist (avoids separate MWA signature)
+    if (needsWalletCreation) {
+      tx.add(buildCreateWalletIx(
+        funderPubkey,
+        ownerPubkey,
+        walletPda,
+        walletBump,
+        dailyLimitLamports,
+        perTxLimitLamports
+      ));
     }
 
-    // The agent keypair needs SOL to pay rent for the SessionKey PDA.
-    // SessionKey account is 154 bytes → ~0.0015 SOL rent-exempt minimum.
-    // We transfer a small buffer (0.003 SOL) from the fee payer to the
-    // agent so it can fund the create_account CPI inside CreateSession.
+    // 1. Fund agent so it can pay SessionKey PDA rent during finalization
     const sessionRentLamports = await withRpcRetry(() =>
       connection.getMinimumBalanceForRentExemption(154) // SessionKey::SIZE
     );
-    // Add a small buffer for compute budget
-    const agentFundingLamports = sessionRentLamports + 100_000; // ~0.0001 SOL extra
+    const signerRentLamports = await withRpcRetry(() =>
+      connection.getMinimumBalanceForRentExemption(0)
+    );
+    const agentFundingLamports = sessionRentLamports + signerRentLamports + 500_000;
 
-    const fundAgentIx = SystemProgram.transfer({
+    tx.add(SystemProgram.transfer({
       fromPubkey: funderPubkey,
       toPubkey: agentKeypair.publicKey,
       lamports: agentFundingLamports,
-    });
+    }));
 
-    const tx = new Transaction();
-    tx.add(fundAgentIx);    // 1. Fund agent so it can pay session PDA rent
-    tx.add(registerIx);     // 2. Owner registers agent on wallet
-    tx.add(createSessionIx); // 3. Agent creates session key
+    // 2. Fund session signer with user's deposit (trading capital)
+    // This is the ONLY place the user's deposit goes — directly to the
+    // session signer that actually pays for trading operations.
+    tx.add(SystemProgram.transfer({
+      fromPubkey: funderPubkey,
+      toPubkey: sessionKeypair.publicKey,
+      lamports: depositLamports,
+    }));
+
+    // 3. Register agent on the Seal wallet
+    tx.add(registerIx);
+
     tx.recentBlockhash = blockhash;
     tx.feePayer = funderPubkey;
 
-    // Backend signs with agent keypair (CreateSession requires agent as signer)
-    tx.partialSign(agentKeypair);
-
-    // Optionally sponsor-sign
-    if (sponsored) {
-      await sponsorSign(tx);
-    }
-
     const serialized = tx
-      .serialize({ requireAllSignatures: false })
+      .serialize({ requireAllSignatures: false, verifySignatures: false })
       .toString("base64");
+
+    // Total user cost breakdown for transparency
+    const totalUserCostLamports = agentFundingLamports + depositLamports
+      + (needsWalletCreation ? 2_900_000 : 0); // ~0.0029 SOL wallet PDA rent estimate
+    const totalUserCostSol = totalUserCostLamports / LAMPORTS_PER_SOL;
+    const sessionFundingSol = depositLamports / LAMPORTS_PER_SOL;
 
     // ── Persist keys in DB ──
     // Store private keys as base64-encoded Uint8Array (64 bytes: seed + pubkey)
@@ -1336,8 +1561,14 @@ wallet.post(
       sessionAddress: sessionPda.toBase58(),
       sessionPubkey: sessionKeypair.publicKey.toBase58(),
       allowedPrograms: allowedPrograms.map((programId) => programId.toBase58()),
+      effectiveSessionMaxAmountSol,
+      effectiveSessionMaxPerTxSol,
+      walletCreated: needsWalletCreation,
+      walletAddress: walletPda.toBase58(),
+      sessionFundingSol,
+      totalCostSol: totalUserCostSol,
       transaction: serialized,
-      sponsored,
+      requiresOwnerSignature: true,
       network: config.SOLANA_NETWORK,
       blockhash,
       lastValidBlockHeight,
@@ -1475,20 +1706,372 @@ wallet.post(
 );
 
 // ═══════════════════════════════════════════════════════════════
+// Withdraw SOL from session signers → owner
+// ═══════════════════════════════════════════════════════════════
+
+const withdrawSchema = z.object({
+  /** SOL to withdraw. Use 0 or omit to withdraw maximum available. */
+  amountSol: z.number().min(0).max(10_000).default(0),
+  /** Optional bot IDs to withdraw from. If omitted, drains all. */
+  botIds: z.array(z.string()).optional(),
+});
+
+const prepareRecoverWalletSchema = z.object({});
+
+// ── NOTE: Direct SOL withdraw via SystemProgram.transfer is IMPOSSIBLE ──
+// The Seal wallet PDA is owned by the Seal program, not the System Program.
+// SystemProgram.transfer requires the sender account to be owned by
+// SystemProgram, so it will always fail with "Provided owner is not allowed".
+//
+// Use POST /wallet/prepare-recover-wallet instead — this closes the wallet
+// via the Seal program's CloseWallet instruction, returning ALL lamports
+// to the owner. For partial withdrawals, the Seal program would need a
+// dedicated WithdrawFromWallet instruction (future upgrade).
+
+/**
+ * POST /wallet/withdraw
+ * Withdraw SOL from the Sage smart wallet back to the user's connected wallet.
+ *
+ * Uses an existing live-bot session keypair to issue a
+ * SystemProgram::Transfer via ExecuteViaSession. The backend signs
+ * and submits — no MWA interaction needed.
+ *
+ * If amountSol is 0, withdraws everything except a 0.003 SOL rent buffer.
+ */
+wallet.post(
+  "/prepare-recover-wallet",
+  requireAuth,
+  zValidator("json", prepareRecoverWalletSchema),
+  async (c) => {
+    const userId = c.var.userId;
+    const ownerAddress = c.var.walletAddress;
+    const ownerPubkey = new PublicKey(ownerAddress);
+    const walletPda = await getCanonicalWalletPda(userId, ownerPubkey);
+    const connection = getConnection();
+
+    const walletAccount = await withRpcRetry(() => connection.getAccountInfo(walletPda));
+
+    const botRows = await db
+      .select({
+        agentPubkey: bots.agentPubkey,
+        sessionPubkey: bots.sessionPubkey,
+        sessionSecretKey: bots.sessionSecretKey,
+      })
+      .from(bots)
+      .where(and(eq(bots.userId, userId), eq(bots.mode, "live")));
+
+    const uniqueAgents = [
+      ...new Set(
+        botRows
+          .map((b) => b.agentPubkey)
+          .filter((v): v is string => Boolean(v))
+      ),
+    ];
+
+    const tx = new Transaction();
+    tx.feePayer = ownerPubkey;
+
+    // ── Drain all session signers back to owner ──
+    // Session signers are System-owned keypairs — we have their secret
+    // keys and can sign SystemProgram::Transfer directly.
+    // Transfer the FULL balance — the tx fee comes from feePayer (owner),
+    // so the session signer can go to 0 lamports (garbage collected).
+    const sessionSigners: Keypair[] = [];
+    const seen = new Set<string>();
+    let sessionSolRecovered = 0;
+
+    for (const bot of botRows) {
+      if (!bot.sessionPubkey || !bot.sessionSecretKey || seen.has(bot.sessionPubkey)) continue;
+      seen.add(bot.sessionPubkey);
+      try {
+        const sessionKp = Keypair.fromSecretKey(
+          Buffer.from(bot.sessionSecretKey, "base64")
+        );
+        const balance = await connection.getBalance(sessionKp.publicKey);
+        if (balance > 0) {
+          tx.add(
+            SystemProgram.transfer({
+              fromPubkey: sessionKp.publicKey,
+              toPubkey: ownerPubkey,
+              lamports: balance,
+            })
+          );
+          sessionSigners.push(sessionKp);
+          sessionSolRecovered += balance / LAMPORTS_PER_SOL;
+        }
+      } catch { /* skip invalid keys */ }
+    }
+
+    // ── Deregister agents + close wallet (if PDA exists) ──
+    if (walletAccount) {
+      for (const agentPubkeyStr of uniqueAgents) {
+        const agentPubkey = new PublicKey(agentPubkeyStr);
+        const [agentPda] = deriveAgentPda(walletPda, agentPubkey);
+        const agentAccount = await withRpcRetry(() => connection.getAccountInfo(agentPda));
+        if (agentAccount) {
+          tx.add(buildDeregisterAgentIx(ownerPubkey, walletPda, agentPda));
+        }
+      }
+      tx.add(buildCloseWalletIx(ownerPubkey, walletPda));
+    }
+
+    // If there's nothing to recover at all, error out
+    if (tx.instructions.length === 0) {
+      throw createApiError(
+        "Nothing to recover — no wallet PDA and no session signer funds found.",
+        404
+      );
+    }
+
+    const { blockhash, lastValidBlockHeight } = await withRpcRetry(() =>
+      connection.getLatestBlockhash("confirmed")
+    );
+    tx.recentBlockhash = blockhash;
+    tx.lastValidBlockHeight = lastValidBlockHeight;
+
+    // Partially sign with session signers (backend has keys)
+    for (const signer of sessionSigners) {
+      tx.partialSign(signer);
+    }
+
+    return c.json({
+      success: true,
+      transaction: tx.serialize({
+        requireAllSignatures: false,
+        verifySignatures: false,
+      }).toString("base64"),
+      network: config.SOLANA_NETWORK,
+      walletAddress: walletPda.toBase58(),
+      recoveryClosesWallet: !!walletAccount,
+      agentsToRemove: uniqueAgents.length,
+      sessionSignersDrained: sessionSigners.length,
+      sessionSolRecovered: +sessionSolRecovered.toFixed(6),
+      blockhash,
+      lastValidBlockHeight,
+    });
+  }
+);
+
+/**
+ * POST /wallet/withdraw
+ *
+ * Smart withdrawal: drain ALL user funds — session signers + wallet PDA.
+ *
+ * 1. Session signers: drained via SystemProgram.transfer (backend signs)
+ * 2. Wallet PDA: drained via DeregisterAgent + CloseWallet (owner signs)
+ *
+ * - If amountSol is 0, drains everything from all (or specified) bots.
+ * - If amountSol > 0, drains that exact amount spread across session
+ *   signers first; wallet PDA is only closed when draining everything.
+ * - If botIds is provided, only those bots' session signers are touched.
+ *
+ * One TX, one MWA signature, all funds returned.
+ */
+wallet.post(
+  "/withdraw",
+  requireAuth,
+  zValidator("json", withdrawSchema),
+  async (c) => {
+    const userId = c.var.userId;
+    const ownerAddress = c.var.walletAddress;
+    const ownerPubkey = new PublicKey(ownerAddress);
+    const connection = getConnection();
+    const body = c.req.valid("json");
+
+    const requestedLamports = Math.floor(body.amountSol * LAMPORTS_PER_SOL);
+    const drainAll = requestedLamports === 0;
+
+    // ── Check wallet PDA balance ──
+    let walletPdaLamports = 0;
+    let walletPda: PublicKey | null = null;
+    let walletAccountExists = false;
+    try {
+      walletPda = await getCanonicalWalletPda(userId, ownerPubkey);
+      const walletAccount = await withRpcRetry(() =>
+        connection.getAccountInfo(walletPda!)
+      );
+      walletAccountExists = !!walletAccount;
+      if (walletAccountExists) {
+        walletPdaLamports = await connection.getBalance(walletPda);
+      }
+    } catch { /* wallet may not exist */ }
+
+    // ── Fetch ALL session signers (including soft-deleted bots) ──
+    const sessionRows = await db
+      .select({
+        botId: bots.botId,
+        sessionPubkey: bots.sessionPubkey,
+        sessionSecretKey: bots.sessionSecretKey,
+        agentPubkey: bots.agentPubkey,
+        name: bots.name,
+      })
+      .from(bots)
+      .where(and(
+        eq(bots.userId, userId),
+        eq(bots.mode, "live"),
+        isNotNull(bots.sessionPubkey),
+        isNotNull(bots.sessionSecretKey),
+      ));
+
+    // Filter by botIds if specified
+    const filtered = body.botIds
+      ? sessionRows.filter((r) => body.botIds!.includes(r.botId))
+      : sessionRows;
+
+    // Deduplicate by sessionPubkey and get on-chain balances
+    const seen = new Set<string>();
+    const sources: { kp: Keypair; balance: number; botId: string; name: string | null }[] = [];
+
+    for (const row of filtered) {
+      if (!row.sessionPubkey || !row.sessionSecretKey || seen.has(row.sessionPubkey)) continue;
+      seen.add(row.sessionPubkey);
+      try {
+        const kp = Keypair.fromSecretKey(Buffer.from(row.sessionSecretKey, "base64"));
+        const balance = await connection.getBalance(kp.publicKey);
+        if (balance > 0) {
+          sources.push({ kp, balance, botId: row.botId, name: row.name });
+        }
+      } catch (err: any) {
+        console.error(`[withdraw] Failed to check session signer for bot ${row.botId}: ${err?.message ?? err}`);
+      }
+    }
+
+    const totalSessionLamports = sources.reduce((sum, s) => sum + s.balance, 0);
+    const totalAvailable = totalSessionLamports + walletPdaLamports;
+
+    if (totalAvailable === 0) {
+      throw createApiError(
+        "No funds available to withdraw. All session signers and wallet PDA are at 0 SOL.",
+        404
+      );
+    }
+
+    // Sort largest-balance-first for efficient draining
+    sources.sort((a, b) => b.balance - a.balance);
+
+    // Build transaction
+    const tx = new Transaction();
+    tx.feePayer = ownerPubkey;
+    const signers: Keypair[] = [];
+    let sessionDrained = 0;
+    const drainDetails: { botId: string; name: string | null; lamports: number }[] = [];
+
+    // ── 1. Drain session signers ──
+    if (drainAll) {
+      // Drain everything from all session signers
+      for (const source of sources) {
+        tx.add(
+          SystemProgram.transfer({
+            fromPubkey: source.kp.publicKey,
+            toPubkey: ownerPubkey,
+            lamports: source.balance,
+          })
+        );
+        signers.push(source.kp);
+        drainDetails.push({ botId: source.botId, name: source.name, lamports: source.balance });
+        sessionDrained += source.balance;
+      }
+    } else {
+      // Drain up to the requested amount
+      let remaining = Math.min(requestedLamports, totalSessionLamports);
+      for (const source of sources) {
+        if (remaining <= 0) break;
+        const take = Math.min(remaining, source.balance);
+        tx.add(
+          SystemProgram.transfer({
+            fromPubkey: source.kp.publicKey,
+            toPubkey: ownerPubkey,
+            lamports: take,
+          })
+        );
+        signers.push(source.kp);
+        drainDetails.push({ botId: source.botId, name: source.name, lamports: take });
+        sessionDrained += take;
+        remaining -= take;
+      }
+    }
+
+    // ── 2. Close wallet PDA to recover its SOL ──
+    // Only when draining everything AND the wallet PDA exists with balance.
+    let closesWallet = false;
+    if (drainAll && walletAccountExists && walletPda && walletPdaLamports > 0) {
+      // Deregister all agents so CloseWallet can succeed
+      const uniqueAgents = [
+        ...new Set(
+          sessionRows
+            .map((b) => b.agentPubkey)
+            .filter((v): v is string => Boolean(v))
+        ),
+      ];
+      for (const agentPubkeyStr of uniqueAgents) {
+        const agentPubkey = new PublicKey(agentPubkeyStr);
+        const [agentPda] = deriveAgentPda(walletPda, agentPubkey);
+        const agentAccount = await withRpcRetry(() => connection.getAccountInfo(agentPda));
+        if (agentAccount) {
+          tx.add(buildDeregisterAgentIx(ownerPubkey, walletPda, agentPda));
+        }
+      }
+      tx.add(buildCloseWalletIx(ownerPubkey, walletPda));
+      closesWallet = true;
+    }
+
+    if (tx.instructions.length === 0) {
+      throw createApiError("No funds available to withdraw.", 404);
+    }
+
+    const { blockhash, lastValidBlockHeight } = await withRpcRetry(() =>
+      connection.getLatestBlockhash("confirmed")
+    );
+    tx.recentBlockhash = blockhash;
+    tx.lastValidBlockHeight = lastValidBlockHeight;
+
+    // Backend signs with session signers
+    for (const signer of signers) {
+      tx.partialSign(signer);
+    }
+
+    const totalWithdrawLamports = sessionDrained + (closesWallet ? walletPdaLamports : 0);
+    const withdrawSol = totalWithdrawLamports / LAMPORTS_PER_SOL;
+
+    return c.json({
+      success: true,
+      transaction: tx.serialize({
+        requireAllSignatures: false,
+        verifySignatures: false,
+      }).toString("base64"),
+      network: config.SOLANA_NETWORK,
+      withdrawSol: +withdrawSol.toFixed(6),
+      totalAvailableSol: +(totalAvailable / LAMPORTS_PER_SOL).toFixed(6),
+      walletPdaSol: +(walletPdaLamports / LAMPORTS_PER_SOL).toFixed(6),
+      closesWallet,
+      details: drainDetails.map((d) => ({
+        botId: d.botId,
+        name: d.name,
+        sol: +(d.lamports / LAMPORTS_PER_SOL).toFixed(6),
+      })),
+      blockhash,
+      lastValidBlockHeight,
+    });
+  }
+);
+
+// ═══════════════════════════════════════════════════════════════
 // Submit a signed transaction
 // ═══════════════════════════════════════════════════════════════
 
 const submitSignedSchema = z.object({
   /** Base64-encoded fully-signed transaction */
   transaction: z.string().min(1),
+  /** Optional bot ID for live-setup finalization after owner submission */
+  setupLiveBotId: z.string().optional(),
+  /** True when this signed TX is the owner-signed wallet recovery flow */
+  recoverWalletClose: z.boolean().optional(),
 });
 
 /**
  * POST /wallet/submit-signed
  * Submit a fully-signed transaction to the Solana network.
  *
- * This is used as a fallback when `signAndSendTransactions` fails
- * (e.g. Phantom simulation failure for sponsored/devnet TXs).
  * The Flutter app uses `signTransactions` (sign-only) and then
  * submits the signed TX via this endpoint.
  */
@@ -1497,27 +2080,135 @@ wallet.post(
   requireAuth,
   zValidator("json", submitSignedSchema),
   async (c) => {
+    const userId = c.var.userId;
+    const ownerAddress = c.var.walletAddress;
     const body = c.req.valid("json");
     const txBytes = Buffer.from(body.transaction, "base64");
 
     const connection = getConnection();
     try {
+      const tx = Transaction.from(txBytes);
       const signature = await connection.sendRawTransaction(txBytes, {
-        skipPreflight: false,
-        preflightCommitment: "confirmed",
+        skipPreflight: true,
+        maxRetries: 5,
       });
 
-      // Wait for confirmation (with timeout)
-      const { blockhash, lastValidBlockHeight } =
-        await connection.getLatestBlockhash();
-      await connection.confirmTransaction(
-        { signature, blockhash, lastValidBlockHeight },
-        "confirmed"
-      );
+      // Poll for confirmation with generous timeout for mainnet.
+      // Resend the TX periodically to improve landing probability.
+      let confirmed = false;
+      const TIMEOUT_MS = 90_000;       // 90 seconds max
+      const POLL_INTERVAL_MS = 1_500;  // poll every 1.5s
+      const RESEND_INTERVAL_MS = 8_000; // resend every 8s
+      const startTime = Date.now();
+      let lastResend = startTime;
+
+      while (!confirmed && Date.now() - startTime < TIMEOUT_MS) {
+        const { value } = await connection.getSignatureStatuses([signature]);
+        const status = value[0];
+
+        if (status?.err) {
+          throw new Error(JSON.stringify(status.err));
+        }
+
+        if (
+          status?.confirmationStatus === "confirmed" ||
+          status?.confirmationStatus === "finalized"
+        ) {
+          confirmed = true;
+          break;
+        }
+
+        // Resend periodically — mainnet validators may drop TXs
+        if (Date.now() - lastResend >= RESEND_INTERVAL_MS) {
+          try {
+            await connection.sendRawTransaction(txBytes, {
+              skipPreflight: true,
+              maxRetries: 0,
+            });
+          } catch (_) {
+            // best-effort resend
+          }
+          lastResend = Date.now();
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+      }
+
+      if (!confirmed) {
+        throw new Error(
+          `Transaction was sent but not confirmed within ${Math.round(TIMEOUT_MS / 1000)}s ` +
+          `(blockhash ${tx.recentBlockhash ?? "unknown"}). ` +
+          `It may still land — check the signature: ${signature}`
+        );
+      }
+
+      let finalizeResult:
+        | {
+          finalized: true;
+          finalizeSignature: string;
+          sessionAddress: string;
+          sessionPubkey: string;
+        }
+        | undefined;
+
+      if (body.setupLiveBotId) {
+        const ownerPubkey = new PublicKey(ownerAddress);
+        const walletPda = await getCanonicalWalletPda(userId, ownerPubkey);
+        const [bot] = await db
+          .select({
+            positionSizeSOL: bots.positionSizeSOL,
+            maxDailyLossSOL: bots.maxDailyLossSOL,
+          })
+          .from(bots)
+          .where(and(eq(bots.botId, body.setupLiveBotId), eq(bots.userId, userId)));
+
+        const finalized = await finalizeLiveSession({
+          botId: body.setupLiveBotId,
+          userId,
+          walletPda,
+          durationSecs: 7 * 24 * 60 * 60,
+          // Session limits must NOT exceed the agent's daily_limit / per_tx_limit
+          // that were set during RegisterAgent (same values used in setup-live).
+          maxAmountSol: bot?.maxDailyLossSOL ?? 0.5,
+          maxPerTxSol: bot?.positionSizeSOL ?? 0.1,
+        });
+
+        finalizeResult = {
+          finalized: true,
+          finalizeSignature: finalized.signature,
+          sessionAddress: finalized.sessionAddress,
+          sessionPubkey: finalized.sessionPubkey,
+        };
+      }
+
+      if (body.recoverWalletClose == true) {
+        await db.update(users)
+          .set({
+            sealWalletAddress: null,
+            updatedAt: new Date(),
+          })
+          .where(eq(users.id, userId));
+
+        await db.update(bots)
+          .set({
+            agentPubkey: null,
+            agentConfigAddress: null,
+            agentSecretKey: null,
+            sessionAddress: null,
+            sessionPubkey: null,
+            sessionSecretKey: null,
+            status: "stopped",
+            lastError: null,
+            updatedAt: new Date(),
+          })
+          .where(eq(bots.userId, userId));
+      }
 
       return c.json({
         success: true,
         signature,
+        ...finalizeResult,
+        recoveredWalletClosed: body.recoverWalletClose == true,
       });
     } catch (e: any) {
       const msg = e?.message || e?.toString() || "Unknown error";

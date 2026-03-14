@@ -13,6 +13,7 @@ import {
     Connection,
     ComputeBudgetProgram,
     Keypair,
+    LAMPORTS_PER_SOL,
     PublicKey,
     SystemProgram,
     Transaction,
@@ -46,6 +47,8 @@ function encodeU64(value: bigint): Buffer {
 
 /** ExecuteViaSession discriminant in the Seal program */
 const EXECUTE_VIA_SESSION_DISC = 3;
+/** TransferLamports discriminant in the Seal program */
+const TRANSFER_LAMPORTS_DISC = 13;
 const MEMO_PROGRAM_ID = new PublicKey(
     "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
 );
@@ -257,6 +260,133 @@ export class SealSession {
      */
     async getWalletBalance(): Promise<number> {
         return this.connection.getBalance(this.walletPda);
+    }
+
+    /**
+     * Build a TransferLamports instruction that moves lamports from
+     * the wallet PDA to the session signer (or any destination).
+     *
+     * This uses the Seal program's TransferLamports instruction
+     * (discriminant 13) which directly debits the PDA since the
+     * Seal program owns it.
+     */
+    buildTransferLamportsIx(
+        amountLamports: bigint,
+        destination?: PublicKey
+    ): TransactionInstruction {
+        const dest = destination ?? this.sessionPubkey;
+        const data = Buffer.concat([
+            Buffer.from([TRANSFER_LAMPORTS_DISC]),
+            encodeU64(amountLamports),
+        ]);
+
+        return new TransactionInstruction({
+            programId: SEAL_PROGRAM_ID,
+            keys: [
+                { pubkey: this.sessionPubkey, isSigner: true, isWritable: false },
+                { pubkey: this.walletPda, isSigner: false, isWritable: true },
+                { pubkey: this.agentPda, isSigner: false, isWritable: true },
+                { pubkey: this.sessionPda, isSigner: false, isWritable: true },
+                { pubkey: dest, isSigner: false, isWritable: true },
+            ],
+            data,
+        });
+    }
+
+    /**
+     * Pre-fund the session signer from the wallet PDA.
+     *
+     * Checks the wallet PDA balance, calculates how much the session
+     * signer needs for the upcoming operation, and transfers the
+     * difference.
+     *
+     * @param neededLamports  Total lamports the session signer needs
+     * @returns The transfer signature, or null if no transfer needed
+     */
+    async fundSessionFromWallet(
+        neededLamports: number
+    ): Promise<{ funded: boolean; transferred: number; signature?: string; error?: string }> {
+        const [sessionBalance, walletBalance] = await Promise.all([
+            this.connection.getBalance(this.sessionPubkey),
+            this.connection.getBalance(this.walletPda),
+        ]);
+
+        if (sessionBalance >= neededLamports) {
+            return { funded: true, transferred: 0 };
+        }
+
+        const deficit = neededLamports - sessionBalance;
+        // Keep minimum rent on wallet PDA (SmartWallet = 278 bytes ≈ 0.003 SOL)
+        const MIN_WALLET_RENT = 890_880;
+        const maxTransferable = walletBalance - MIN_WALLET_RENT;
+
+        if (maxTransferable <= 0) {
+            const walletSOL = (walletBalance / LAMPORTS_PER_SOL).toFixed(4);
+            return {
+                funded: false,
+                transferred: 0,
+                error: `Wallet PDA has ${walletSOL} SOL, entire balance needed for rent`,
+            };
+        }
+
+        // Transfer the minimum of what we need vs what's available
+        const transferAmount = Math.min(deficit, maxTransferable);
+
+        if (transferAmount < 10_000) {
+            return {
+                funded: false,
+                transferred: 0,
+                error: `Transfer amount too small: ${transferAmount} lamports`,
+            };
+        }
+
+        log.info(
+            {
+                sessionBalance: (sessionBalance / LAMPORTS_PER_SOL).toFixed(4),
+                walletBalance: (walletBalance / LAMPORTS_PER_SOL).toFixed(4),
+                transferAmount: (transferAmount / LAMPORTS_PER_SOL).toFixed(4),
+                needed: (neededLamports / LAMPORTS_PER_SOL).toFixed(4),
+            },
+            "Pre-funding session signer from wallet PDA"
+        );
+
+        const ix = this.buildTransferLamportsIx(BigInt(transferAmount));
+        const { blockhash, lastValidBlockHeight } =
+            await this.connection.getLatestBlockhash();
+
+        const tx = new Transaction();
+        tx.add(
+            ComputeBudgetProgram.setComputeUnitLimit({ units: 50_000 }),
+            ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 10_000 }),
+            ix
+        );
+        tx.feePayer = this.sessionPubkey;
+        tx.recentBlockhash = blockhash;
+        tx.lastValidBlockHeight = lastValidBlockHeight;
+
+        tx.sign(this.sessionKeypair);
+
+        try {
+            const signature = await this.connection.sendRawTransaction(
+                tx.serialize(),
+                { skipPreflight: false, preflightCommitment: "confirmed" }
+            );
+            await this.connection.confirmTransaction(
+                { signature, blockhash, lastValidBlockHeight },
+                "confirmed"
+            );
+
+            log.info(
+                { signature, amountSOL: (transferAmount / LAMPORTS_PER_SOL).toFixed(4) },
+                "Session signer pre-funded from wallet PDA"
+            );
+
+            return { funded: true, transferred: transferAmount, signature };
+        } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            log.error({ error: msg }, "Failed to pre-fund session from wallet PDA");
+            return { funded: false, transferred: 0, error: msg };
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════
