@@ -19,7 +19,14 @@ import {
     Connection,
     Keypair,
     LAMPORTS_PER_SOL,
+    SystemProgram,
+    Transaction,
+    TransactionInstruction,
 } from "@solana/web3.js";
+import {
+    ASSOCIATED_TOKEN_PROGRAM_ID,
+    TOKEN_PROGRAM_ID,
+} from "@solana/spl-token";
 import BN from "bn.js";
 import { v4 as uuidv4 } from "uuid";
 
@@ -40,6 +47,14 @@ import { CircuitBreaker } from "./circuit-breaker.js";
 import { logger } from "../middleware/logger.js";
 
 const log = logger.child({ module: "seal-executor" });
+
+// Meteora DLMM instruction discriminators from the checked-in IDL.
+const DLMM_INITIALIZE_POSITION_DISC = Buffer.from([
+    219, 192, 234, 71, 190, 191, 102, 80,
+]);
+const DLMM_INITIALIZE_BIN_ARRAY_DISC = Buffer.from([
+    35, 86, 19, 185, 78, 212, 75, 211,
+]);
 
 // ═══════════════════════════════════════════════════════════════
 // Config
@@ -77,6 +92,107 @@ export class SealExecutor implements ITradingExecutor {
     private circuitBreaker: CircuitBreaker;
 
     private positions: Map<string, TrackedPosition> = new Map();
+
+    private matchesDiscriminator(data: Buffer, disc: Buffer): boolean {
+        return data.length >= disc.length && data.subarray(0, disc.length).equals(disc);
+    }
+
+    /**
+     * Meteora's SDK assumes a normal system wallet is both payer and owner.
+     * Seal wallets are PDAs with data, so they cannot be the source account
+     * for raw SystemProgram transfers or rent-paying account creation.
+     *
+     * We rewrite only the payer-style accounts to the session signer while
+     * keeping the wallet PDA as the position/token owner for the CPI.
+     */
+    private rewriteDelegatedIx(innerIx: TransactionInstruction): TransactionInstruction {
+        const walletPda = this.session.getWalletPda();
+        const sessionSigner = this.session.getSessionKeypair().publicKey;
+        const keys = innerIx.keys.map((key) => ({ ...key }));
+
+        if (
+            innerIx.programId.equals(ASSOCIATED_TOKEN_PROGRAM_ID) &&
+            keys.length >= 1 &&
+            keys[0].pubkey.equals(walletPda)
+        ) {
+            keys[0] = {
+                ...keys[0],
+                pubkey: sessionSigner,
+                isSigner: true,
+                isWritable: true,
+            };
+        } else if (
+            innerIx.programId.equals(SystemProgram.programId) &&
+            keys.length >= 1 &&
+            keys[0].pubkey.equals(walletPda)
+        ) {
+            keys[0] = {
+                ...keys[0],
+                pubkey: sessionSigner,
+                isSigner: true,
+                isWritable: true,
+            };
+        } else if (
+            this.matchesDiscriminator(innerIx.data, DLMM_INITIALIZE_POSITION_DISC) &&
+            keys.length >= 4 &&
+            keys[0].pubkey.equals(walletPda)
+        ) {
+            // Accounts: payer, position, lbPair, owner, ...
+            keys[0] = {
+                ...keys[0],
+                pubkey: sessionSigner,
+                isSigner: true,
+                isWritable: true,
+            };
+        } else if (
+            this.matchesDiscriminator(innerIx.data, DLMM_INITIALIZE_BIN_ARRAY_DISC) &&
+            keys.length >= 3 &&
+            keys[2].pubkey.equals(walletPda)
+        ) {
+            // Accounts: lbPair, binArray, funder, ...
+            keys[2] = {
+                ...keys[2],
+                pubkey: sessionSigner,
+                isSigner: true,
+                isWritable: true,
+            };
+        } else if (
+            innerIx.programId.equals(TOKEN_PROGRAM_ID) &&
+            innerIx.data.length >= 1 &&
+            innerIx.data[0] === 9 && // CloseAccount discriminator
+            keys.length >= 2 &&
+            keys[1].pubkey.equals(walletPda)
+        ) {
+            // Token::CloseAccount accounts: [account, destination, authority]
+            // Redirect destination from walletPda → sessionSigner so SOL
+            // from closed wSOL ATAs returns to the operational account.
+            keys[1] = {
+                ...keys[1],
+                pubkey: sessionSigner,
+                isSigner: false,
+                isWritable: true,
+            };
+        }
+
+        return new TransactionInstruction({
+            programId: innerIx.programId,
+            keys,
+            data: innerIx.data,
+        });
+    }
+
+    private rewriteDelegatedTx(tx: Transaction): Transaction {
+        const rewritten = new Transaction();
+        rewritten.feePayer = this.session.getSessionKeypair().publicKey;
+        rewritten.recentBlockhash = tx.recentBlockhash;
+        rewritten.lastValidBlockHeight = tx.lastValidBlockHeight;
+
+        for (const ix of tx.instructions) {
+            rewritten.add(this.rewriteDelegatedIx(ix));
+        }
+
+        return rewritten;
+    }
 
     constructor(
         connection: Connection,
@@ -156,15 +272,51 @@ export class SealExecutor implements ITradingExecutor {
             const activeBin = await dlmm.getActiveBin();
             const positionKeypair = Keypair.generate();
 
-            // ── Rent-aware position sizing ──
-            const RENT_BUFFER = 25_000_000; // 0.025 SOL
-            const currentBalance = await this.connection.getBalance(walletPda);
-            const maxDeposit = Math.max(0, currentBalance - RENT_BUFFER);
+            // ── Pre-fund session signer from wallet PDA ──
+            // The session signer needs SOL for:
+            //   - position account rent (~0.057 SOL)
+            //   - bin array creation rent
+            //   - ATA creation rent
+            //   - SOL wrapping transfers (the actual liquidity deposit)
+            //   - transaction fees
+            // We use the Seal program's TransferLamports instruction to
+            // move funds from the wallet PDA → session signer before the trade.
+            const POSITION_RENT_ESTIMATE = 60_000_000; // ~0.06 SOL
+            const TX_FEE_BUFFER = 10_000_000;          // ~0.01 SOL
+            const requestedTotal = amountX.add(amountY).toNumber();
+            const sessionNeeded = requestedTotal + POSITION_RENT_ESTIMATE + TX_FEE_BUFFER;
 
+            const fundResult = await this.session.fundSessionFromWallet(sessionNeeded);
+            if (!fundResult.funded) {
+                const walletBalance = await this.connection.getBalance(walletPda);
+                const has = (walletBalance / LAMPORTS_PER_SOL).toFixed(4);
+                const needs = (sessionNeeded / LAMPORTS_PER_SOL).toFixed(2);
+                const depositNeeded = (Math.ceil((sessionNeeded - walletBalance) / 10_000_000) / 100).toFixed(2);
+                log.warn(
+                    {
+                        walletBalance: has,
+                        needed: needs,
+                        depositNeeded,
+                        positionSizeSOL: (requestedTotal / LAMPORTS_PER_SOL).toFixed(4),
+                        fundError: fundResult.error,
+                    },
+                    "Cannot pre-fund session — insufficient wallet PDA balance"
+                );
+                return {
+                    success: false,
+                    error: `insufficient_balance:${has}:${needs}:${depositNeeded}`,
+                };
+            }
+
+            // Re-check actual session balance after funding
+            const sessionSignerBalance = await this.connection.getBalance(
+                this.session.getSessionKeypair().publicKey
+            );
+
+            // Adjust position size if session signer still can't cover full request
+            const maxDeposit = sessionSignerBalance - POSITION_RENT_ESTIMATE - TX_FEE_BUFFER;
             let adjX = amountX;
             let adjY = amountY;
-            const requestedTotal = amountX.add(amountY).toNumber();
-
             if (requestedTotal > maxDeposit) {
                 const ratio = maxDeposit / requestedTotal;
                 adjX = new BN(Math.floor(amountX.toNumber() * ratio));
@@ -174,16 +326,20 @@ export class SealExecutor implements ITradingExecutor {
                         requested: (requestedTotal / LAMPORTS_PER_SOL).toFixed(4),
                         adjusted: (maxDeposit / LAMPORTS_PER_SOL).toFixed(4),
                     },
-                    "Adjusted position size for rent costs"
+                    "Adjusted position size for session signer balance"
                 );
             }
 
             const adjTotal = adjX.add(adjY).toNumber();
             const minLamports = (this.config.minPositionSOL ?? 0.05) * LAMPORTS_PER_SOL;
             if (adjTotal < minLamports) {
+                const adjSOL = (adjTotal / LAMPORTS_PER_SOL).toFixed(6);
+                const minSOL = (minLamports / LAMPORTS_PER_SOL).toFixed(2);
+                const shortfall = ((minLamports - adjTotal + POSITION_RENT_ESTIMATE + TX_FEE_BUFFER) / LAMPORTS_PER_SOL);
+                const depositNeeded = (Math.ceil(shortfall * 100) / 100).toFixed(2);
                 return {
                     success: false,
-                    error: `Insufficient wallet balance: ${(adjTotal / LAMPORTS_PER_SOL).toFixed(4)} SOL`,
+                    error: `insufficient_balance:${adjSOL}:${minSOL}:${depositNeeded}`,
                 };
             }
 
@@ -199,11 +355,12 @@ export class SealExecutor implements ITradingExecutor {
                     strategyType: strategy.strategyType,
                 },
             });
+            const delegatedCreateTx = this.rewriteDelegatedTx(createTx);
 
             // ── Wrap in executeViaSession ──
             const amountLamports = BigInt(adjTotal);
             await this.session.assertFeePayerFunded();
-            const wrappedTx = this.session.wrapTransaction(createTx, amountLamports);
+            const wrappedTx = this.session.wrapTransaction(delegatedCreateTx, amountLamports);
             const txWithFees = this.txSender.addPriorityFee(wrappedTx);
 
             // Sign with session keypair + position keypair
@@ -382,7 +539,8 @@ export class SealExecutor implements ITradingExecutor {
             for (const tx of txArray) {
                 // Wrap in executeViaSession (amount = 0 for withdrawals)
                 await this.session.assertFeePayerFunded();
-                const wrappedTx = this.session.wrapTransaction(tx, 0n);
+                const delegatedTx = this.rewriteDelegatedTx(tx);
+                const wrappedTx = this.session.wrapTransaction(delegatedTx, 0n);
                 const txWithFees = this.txSender.addPriorityFee(wrappedTx);
                 const result = await this.txSender.sendTransaction(txWithFees, [
                     sessionKeypair,
@@ -552,8 +710,13 @@ export class SealExecutor implements ITradingExecutor {
     }
 
     async getBalance(): Promise<BN> {
-        const balance = await this.session.getWalletBalance();
-        return new BN(balance);
+        // Return wallet PDA balance — this is the user's actual trading capital.
+        // The session signer is pre-funded from the wallet PDA before each trade
+        // via the TransferLamports instruction.
+        const walletBalance = await this.connection.getBalance(
+            this.session.getWalletPda()
+        );
+        return new BN(walletBalance);
     }
 
     getPerformanceSummary(): {
