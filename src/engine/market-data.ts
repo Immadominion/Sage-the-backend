@@ -230,6 +230,9 @@ export class MarketDataProvider implements IMarketDataProvider {
     const pools = await this.fetchAllPools();
 
     return pools.filter((pool) => {
+      // Skip pools missing essential identity fields
+      if (!pool.address || !pool.name) return false;
+
       if (pool.is_blacklisted) return false;
 
       if (config.solPairsOnly) {
@@ -238,10 +241,10 @@ export class MarketDataProvider implements IMarketDataProvider {
         if (!isSOLPair) return false;
       }
 
-      if (config.blacklist.includes(pool.mint_x)) return false;
-      if (config.blacklist.includes(pool.mint_y)) return false;
+      if (pool.mint_x && config.blacklist.includes(pool.mint_x)) return false;
+      if (pool.mint_y && config.blacklist.includes(pool.mint_y)) return false;
 
-      if (pool.trade_volume_24h < config.minVolume24h) return false;
+      if ((pool.trade_volume_24h ?? 0) < config.minVolume24h) return false;
 
       const liquidity = parseFloat(pool.liquidity) || 0;
       if (liquidity < config.minLiquidity) return false;

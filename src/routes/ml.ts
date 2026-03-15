@@ -1,9 +1,9 @@
 /**
- * ML routes — Proxy to the Python ML prediction service.
+ * ML routes — In-process XGBoost model status and prediction endpoints.
  *
- * GET  /ml/health    — check ML service status + model info
+ * GET  /ml/health    — model status + info
  * POST /ml/predict   — direct prediction from features (for testing/debugging)
- * POST /ml/reload    — hot-reload the model without restarting ML service
+ * POST /ml/reload    — hot-reload the model from disk
  * GET  /ml/feedback  — export closed positions with V3 features for online learning
  */
 
@@ -14,7 +14,6 @@ import { requireAuth, type AuthVariables } from "../middleware/auth.js";
 import { createApiError } from "../middleware/error.js";
 import { MLPredictor } from "../engine/ml-predictor.js";
 import { V3_FEATURE_NAMES } from "../engine/ml-features.js";
-import config from "../config.js";
 import db from "../db/index.js";
 import { positions } from "../db/schema.js";
 import { eq, and, isNotNull } from "drizzle-orm";
@@ -22,13 +21,8 @@ import { LAMPORTS_PER_SOL } from "../engine/types.js";
 
 const ml = new Hono<{ Variables: AuthVariables }>();
 
-// Shared ML predictor instance
-const mlPredictor = new MLPredictor({
-  baseUrl: config.ML_SERVICE_URL,
-  timeoutMs: 5000,
-  enabled: true,
-  apiKey: config.ML_API_KEY,
-});
+// Shared ML predictor instance (in-process, no HTTP)
+const mlPredictor = new MLPredictor({ enabled: true });
 
 // ═══════════════════════════════════════════════════════════════
 // Public: Health Check
@@ -41,8 +35,7 @@ ml.get("/health", async (c) => {
     return c.json(
       {
         status: "unavailable",
-        message: "ML service is not running or unreachable",
-        expectedUrl: config.ML_SERVICE_URL,
+        message: "ML model not loaded — ensure models/lp_predictor_v3_latest.json exists",
         featureNames: V3_FEATURE_NAMES,
       },
       503
@@ -97,36 +90,11 @@ ml.post(
 // ═══════════════════════════════════════════════════════════════
 
 ml.post("/reload", requireAuth, async (c) => {
-  try {
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (config.ML_API_KEY) {
-      headers["X-ML-API-Key"] = config.ML_API_KEY;
-    }
-
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10_000);
-
-    const response = await fetch(`${config.ML_SERVICE_URL}/reload`, {
-      method: "POST",
-      headers,
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
-
-    if (!response.ok) {
-      const text = await response.text();
-      throw createApiError(`Reload failed: ${text}`, response.status);
-    }
-
-    const result = await response.json();
-    return c.json(result);
-  } catch (error) {
-    if (error && typeof error === "object" && "statusCode" in error) throw error;
-    throw createApiError(
-      `ML service unreachable: ${error instanceof Error ? error.message : String(error)}`,
-      503
-    );
+  const result = mlPredictor.reloadModel();
+  if (!result.success) {
+    throw createApiError(`Reload failed: ${result.error}`, 500);
   }
+  return c.json({ status: "reloaded", model: result.model });
 });
 
 // ═══════════════════════════════════════════════════════════════

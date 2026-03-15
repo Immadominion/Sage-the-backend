@@ -15,12 +15,12 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
 import crypto from "node:crypto";
-import { requireAuth, type AuthVariables } from "../middleware/auth.js";
 import { createApiError } from "../middleware/error.js";
 import db from "../db/index.js";
 import { bots, positions, tradeLog } from "../db/schema.js";
 import { eq, and, sql, isNull } from "drizzle-orm";
 import { orchestrator } from "../engine/orchestrator.js";
+import { requireAuth, type AuthVariables } from "../middleware/auth.js";
 import { LAMPORTS_PER_SOL } from "../engine/types.js";
 import config from "../config.js";
 
@@ -85,6 +85,12 @@ async function getUserBot(userId: number, botId: string) {
     .from(bots)
     .where(and(eq(bots.botId, botId), eq(bots.userId, userId)));
   return row;
+}
+
+/** Strip secret keys from bot data before sending to the client. */
+function sanitizeBot<T extends Record<string, unknown>>(bot: T): Omit<T, 'agentSecretKey' | 'sessionSecretKey'> {
+  const { agentSecretKey, sessionSecretKey, ...safe } = bot;
+  return safe as Omit<T, 'agentSecretKey' | 'sessionSecretKey'>;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -179,7 +185,7 @@ bot.post("/create", zValidator("json", createBotSchema), async (c) => {
 
   const created = await getUserBot(userId, botId);
 
-  return c.json({ success: true, bot: created }, 201);
+  return c.json({ success: true, bot: sanitizeBot(created!) }, 201);
 });
 
 /**
@@ -194,21 +200,34 @@ bot.get("/list", async (c) => {
     .from(bots)
     .where(and(eq(bots.userId, userId), isNull(bots.deletedAt)));
 
-  // Enrich each bot with the authoritative current balance
+  // Enrich each bot with authoritative live engine state + balance.
   const enriched = userBots.map((b) => {
+    const engineRunning = orchestrator.isRunning(b.botId);
+    const engineStats = orchestrator.getEngineStats(b.botId);
     const performanceSummary = orchestrator.getPerformanceSummary(b.botId);
+    const livePositions = orchestrator.getActivePositions(b.botId);
     let currentBalanceSol: number;
     if (performanceSummary) {
       currentBalanceSol = performanceSummary.currentBalanceSol;
+    } else if (b.mode === 'live') {
+      // Live bots: actual capital lives on-chain in the Seal wallet,
+      // not in a virtual balance. Show 0 until the engine reports real P&L.
+      currentBalanceSol = 0;
     } else if (b.currentVirtualBalanceLamports != null) {
       currentBalanceSol = b.currentVirtualBalanceLamports / LAMPORTS_PER_SOL;
-    } else if (b.mode === 'live') {
-      // Live bots that have never run have no balance yet — show 0
-      currentBalanceSol = 0;
     } else {
       currentBalanceSol = b.simulationBalanceSOL;
     }
-    return { ...b, currentBalanceSol };
+
+    return {
+      ...sanitizeBot(b),
+      currentBalanceSol,
+      engineRunning,
+      engineStats,
+      performanceSummary,
+      livePositions,
+      activePositionCount: livePositions.length,
+    };
   });
 
   return c.json({ success: true, bots: enriched });
@@ -262,7 +281,7 @@ bot.get("/:botId", async (c) => {
 
   return c.json({
     success: true,
-    bot: botData,
+    bot: sanitizeBot(botData),
     /** Current simulation balance in SOL — always accurate, even when stopped */
     currentBalanceSol,
     activePositionCount: Number(activePositions?.count ?? 0),
@@ -295,7 +314,7 @@ bot.get("/:botId", async (c) => {
 
 /**
  * PUT /bot/:botId/config
- * Update bot configuration (only when stopped).
+ * Update bot configuration (allowed when stopped or errored).
  */
 bot.put(
   "/:botId/config",
@@ -311,7 +330,11 @@ bot.put(
       throw createApiError("Bot not found", 404);
     }
 
-    if (botData.status !== "stopped") {
+    if (
+      botData.status === "running" ||
+      botData.status === "starting" ||
+      botData.status === "stopping"
+    ) {
       throw createApiError(
         "Cannot update config while bot is running. Stop it first.",
         400
@@ -341,7 +364,7 @@ bot.put(
       .where(and(eq(bots.botId, botId), eq(bots.userId, userId)));
 
     const updated = await getUserBot(userId, botId);
-    return c.json({ success: true, bot: updated });
+    return c.json({ success: true, bot: sanitizeBot(updated!) });
   }
 );
 
@@ -392,7 +415,7 @@ bot.put(
       .where(and(eq(bots.botId, botId), eq(bots.userId, userId)));
 
     const updated = await getUserBot(userId, botId);
-    return c.json({ success: true, bot: updated });
+    return c.json({ success: true, bot: sanitizeBot(updated!) });
   }
 );
 
@@ -573,24 +596,35 @@ bot.delete("/:botId", async (c) => {
       .where(and(eq(bots.botId, botId), eq(bots.userId, userId)));
   }
 
+  // ── Auto-withdraw NOT possible ──
+  // SystemProgram.transfer from a Seal wallet PDA always fails because
+  // the PDA is owned by the Seal program, not SystemProgram.
+  // Users must manually recover funds via the wallet recovery flow
+  // (DeregisterAgent + CloseWallet) before or after deleting a bot.
+  let withdrawResult: { signature?: string; withdrawnSol?: number } = {};
+
   // Soft-delete: preserve trade history forever.
-  // Clear agent/session keys so the wallet can be reused by a new bot,
-  // but keep agentPubkey + agentConfigAddress for on-chain audit trail.
+  // Keep agent/session secret keys so the user can still withdraw funds
+  // if auto-withdraw failed.
   await db.update(bots)
     .set({
       deletedAt: new Date(),
-      // Release session so a new bot can use this wallet later
-      sessionAddress: null,
-      sessionPubkey: null,
-      sessionSecretKey: null,
-      // Keep agentPubkey/agentConfigAddress for audit (on-chain references)
-      // Clear secret key — deleted bots should not sign anything
-      agentSecretKey: null,
       updatedAt: new Date(),
     })
     .where(and(eq(bots.botId, botId), eq(bots.userId, userId)));
 
-  return c.json({ success: true, deleted: true });
+  return c.json({
+    success: true,
+    deleted: true,
+    ...(withdrawResult.signature
+      ? {
+        fundsReturned: true,
+        withdrawSignature: withdrawResult.signature,
+        withdrawnSol: withdrawResult.withdrawnSol,
+      }
+      : { fundsReturned: false }
+    ),
+  });
 });
 
 export default bot;

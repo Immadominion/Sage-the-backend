@@ -341,8 +341,35 @@ sage-backend/
 │       └── sponsor.ts        # Transaction sponsor (fee payer)
 ├── drizzle.config.ts         # Drizzle Kit configuration
 ├── package.json
+├── vitest.config.ts          # Test framework configuration
 └── tsconfig.json
 ```
+
+## Testing
+
+The project uses [vitest](https://vitest.dev/) for unit and integration testing.
+
+```bash
+# Run all tests
+npm test
+
+# Run with verbose output
+npx vitest run --reporter=verbose
+
+# Run in watch mode during development
+npx vitest
+
+# Run with Docker PostgreSQL for full integration tests
+./scripts/local-test.sh --full
+```
+
+### Test Suites
+
+| Suite | File | Tests | Covers |
+|-------|------|-------|--------|
+| EmergencyStop | `src/engine/emergency-stop.test.ts` | 22 | Kill switch, loss limits, consecutive losses, serialization, callbacks |
+| Market Data | `src/engine/market-data.test.ts` | 18 | Pool filtering (blacklist, SOL pairs, volume, liquidity, identity) |
+| Health Endpoint | `src/routes/health.test.ts` | 8 | Response structure, degradation behavior, Railway compatibility |
 
 ## License
 

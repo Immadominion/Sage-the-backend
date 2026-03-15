@@ -62,31 +62,22 @@ health.get("/", async (c) => {
     checks.status = "degraded";
   }
 
-  // ML service check
+  // ML model check (in-process — no HTTP call)
   try {
-    const mlUrl = config.ML_SERVICE_URL ?? "http://127.0.0.1:8100";
-    const controller = new AbortController();
-    const mlTimeout = setTimeout(() => controller.abort(), 3000);
-    const mlResponse = await fetch(`${mlUrl}/health`, {
-      signal: controller.signal,
-    });
-    clearTimeout(mlTimeout);
-
-    if (mlResponse.ok) {
-      const mlData = (await mlResponse.json()) as {
-        model?: string;
-        version?: string;
-      };
-      checks.mlService = "connected";
-      checks.mlModel = mlData.model ?? "unknown";
+    const { MLPredictor } = await import("../engine/ml-predictor.js");
+    const predictor = new MLPredictor({ enabled: true });
+    const mlHealth = await predictor.checkHealth();
+    if (mlHealth) {
+      checks.mlService = "loaded";
+      checks.mlModel = mlHealth.model;
     } else {
-      checks.mlService = "error";
-      checks.mlError = `HTTP ${mlResponse.status}`;
+      checks.mlService = "not-loaded";
+      checks.mlError = "Model file not found or invalid";
       // ML is optional — mark as degraded, not down
       if (checks.status === "ok") checks.status = "degraded";
     }
   } catch (err) {
-    checks.mlService = "unreachable";
+    checks.mlService = "error";
     checks.mlError =
       err instanceof Error ? err.message : "Unknown error";
     // ML is optional — app can still function without it

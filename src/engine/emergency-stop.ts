@@ -345,18 +345,45 @@ export class EmergencyStop {
   /**
    * Restore state from a previously serialized JSON string.
    * Used on bot recovery to maintain loss tracking across restarts.
+   * Validates all fields; returns defaults on corruption.
    */
   static deserializeState(json: string): EmergencyStopState | null {
     try {
       const parsed = JSON.parse(json);
-      // Validate essential fields exist
+      // Validate essential fields exist and have correct types
       if (typeof parsed.isTriggered !== "boolean" ||
         typeof parsed.dailyPnlSOL !== "number" ||
         typeof parsed.totalPnlSOL !== "number") {
+        log.warn("EmergencyStop state missing essential fields — resetting");
         return null;
       }
-      return parsed as EmergencyStopState;
+
+      const now = Date.now();
+      const oneHourAgo = now - 60 * 60 * 1000;
+
+      // Sanitize rolling failure arrays — must be arrays of valid timestamps
+      const sanitizeTimestamps = (arr: unknown): number[] => {
+        if (!Array.isArray(arr)) return [];
+        return arr.filter(
+          (t): t is number =>
+            typeof t === "number" && Number.isFinite(t) && t > oneHourAgo && t <= now
+        );
+      };
+
+      return {
+        isTriggered: parsed.isTriggered,
+        triggerReason: typeof parsed.triggerReason === "string" ? parsed.triggerReason : null,
+        triggerTimestamp: typeof parsed.triggerTimestamp === "number" ? parsed.triggerTimestamp : null,
+        dailyPnlSOL: parsed.dailyPnlSOL,
+        totalPnlSOL: parsed.totalPnlSOL,
+        consecutiveLosses: typeof parsed.consecutiveLosses === "number" ? parsed.consecutiveLosses : 0,
+        dailyResetDate: typeof parsed.dailyResetDate === "string" ? parsed.dailyResetDate : new Date().toISOString().slice(0, 10),
+        txFailures: sanitizeTimestamps(parsed.txFailures),
+        apiErrors: sanitizeTimestamps(parsed.apiErrors),
+        totalTriggers: typeof parsed.totalTriggers === "number" ? parsed.totalTriggers : 0,
+      };
     } catch {
+      log.warn("EmergencyStop state JSON parse failed — resetting");
       return null;
     }
   }

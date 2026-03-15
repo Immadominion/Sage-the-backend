@@ -66,10 +66,6 @@ logger.info(
     network: config.SOLANA_NETWORK,
     rpcUrl: config.SOLANA_RPC_URL,
     sealProgramId: config.SEAL_PROGRAM_ID,
-    sponsorEnabled: Boolean(
-      config.SPONSOR_KEYPAIR ||
-      (config.TURNKEY_API_PUBLIC_KEY && config.TURNKEY_SPONSOR_ADDRESS)
-    ),
     extraAllowedPrograms:
       config.SOLANA_NETWORK === "mainnet-beta"
         ? config.SEAL_ALLOWED_PROGRAMS_MAINNET ?? config.SEAL_ALLOWED_PROGRAMS ?? ""
@@ -152,6 +148,7 @@ const server = serve(
   {
     fetch: app.fetch,
     port: config.PORT,
+    hostname: "0.0.0.0",
   },
   (info) => {
     logger.info("═".repeat(60));

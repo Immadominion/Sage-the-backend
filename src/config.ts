@@ -50,14 +50,6 @@ const envSchema = z.object({
     .string()
     .url()
     .default("https://dlmm-api.meteora.ag"),
-  ML_SERVICE_URL: z
-    .string()
-    .url()
-    .default("http://127.0.0.1:8100"),
-  ML_API_KEY: z
-    .string()
-    .optional()
-    .describe("API key for authenticating with the ML prediction service"),
   WALLET_PATH: z
     .string()
     .optional()
@@ -66,34 +58,6 @@ const envSchema = z.object({
     .string()
     .optional()
     .describe("Base64-encoded secret key (alternative to WALLET_PATH)"),
-
-  // ── Sponsor Wallet ──────────────────────────────────────
-  // Option 1: Server-side keypair (simple, recommended for dev/hackathon)
-  SPONSOR_KEYPAIR: z
-    .string()
-    .optional()
-    .describe(
-      "Base58-encoded secret key for the sponsor wallet. " +
-      "Generate with: solana-keygen new --no-bip39-passphrase -o sponsor.json"
-    ),
-
-  // Option 2: Turnkey HSM (production-grade, future upgrade path)
-  TURNKEY_API_PUBLIC_KEY: z
-    .string()
-    .optional()
-    .describe("Turnkey API public key for sponsor wallet HSM"),
-  TURNKEY_API_PRIVATE_KEY: z
-    .string()
-    .optional()
-    .describe("Turnkey API private key for sponsor wallet HSM"),
-  TURNKEY_ORGANIZATION_ID: z
-    .string()
-    .optional()
-    .describe("Turnkey organization ID"),
-  TURNKEY_SPONSOR_ADDRESS: z
-    .string()
-    .optional()
-    .describe("Solana address of the sponsor wallet managed by Turnkey"),
 
   // ── AI Services ──────────────────────────────────────
   ANTHROPIC_API_KEY: z
@@ -115,16 +79,55 @@ if (!parsed.success) {
 }
 
 if (parsed.data.NODE_ENV === "production") {
-  const missingRequired = [
-    parsed.data.SOLANA_NETWORK ? null : "SOLANA_NETWORK",
-    parsed.data.SOLANA_RPC_URL ? null : "SOLANA_RPC_URL",
-    parsed.data.SEAL_PROGRAM_ID ? null : "SEAL_PROGRAM_ID",
-  ].filter(Boolean);
+  const warnings: string[] = [];
+  const errors: string[] = [];
 
-  if (missingRequired.length > 0) {
-    console.error(
-      `❌ Missing required production configuration: ${missingRequired.join(", ")}`
+  // JWT_SECRET must not be the dev default
+  if (
+    parsed.data.JWT_SECRET.includes("dev-secret") ||
+    parsed.data.JWT_SECRET.includes("change-this")
+  ) {
+    errors.push(
+      "JWT_SECRET is using a development default — set a secure random secret"
     );
+  }
+
+  // DATABASE_URL must point to a real database, not localhost
+  if (
+    parsed.data.DATABASE_URL.includes("localhost") ||
+    parsed.data.DATABASE_URL.includes("127.0.0.1")
+  ) {
+    errors.push(
+      "DATABASE_URL points to localhost — set to your Railway/production PostgreSQL URL"
+    );
+  }
+
+  // CORS must not be wildcard in production
+  if (parsed.data.CORS_ORIGINS === "*") {
+    warnings.push(
+      "CORS_ORIGINS is '*' — consider restricting to your frontend domain"
+    );
+  }
+
+  // RPC should not be a public endpoint
+  if (
+    parsed.data.SOLANA_RPC_URL.includes("api.mainnet-beta.solana.com") ||
+    parsed.data.SOLANA_RPC_URL.includes("api.devnet.solana.com")
+  ) {
+    warnings.push(
+      "SOLANA_RPC_URL is a public endpoint — use Helius/Alchemy for reliability"
+    );
+  }
+
+  for (const w of warnings) {
+    console.warn(`⚠️  ${w}`);
+  }
+
+  if (errors.length > 0) {
+    console.error("❌ Production configuration errors:");
+    for (const e of errors) {
+      console.error(`   • ${e}`);
+    }
     process.exit(1);
   }
 }

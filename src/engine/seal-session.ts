@@ -111,12 +111,14 @@ export class SealSession {
     readonly sessionPubkey: PublicKey;
     readonly sessionPda: PublicKey;
 
+    private readonly agentKeypair: Keypair;
     private readonly sessionKeypair: Keypair;
     private readonly connection: Connection;
     private readonly supportedWrappedPrograms: PublicKey[];
 
     constructor(config: SealSessionConfig) {
         this.walletPda = config.walletAddress;
+        this.agentKeypair = config.agentKeypair;
         this.sessionKeypair = config.sessionKeypair;
         this.connection = config.connection;
         this.supportedWrappedPrograms = getSupportedWrappedPrograms();
@@ -360,11 +362,21 @@ export class SealSession {
             ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 10_000 }),
             ix
         );
-        tx.feePayer = this.sessionPubkey;
         tx.recentBlockhash = blockhash;
         tx.lastValidBlockHeight = lastValidBlockHeight;
 
-        tx.sign(this.sessionKeypair);
+        // If session keypair has 0 SOL, it can't pay fees for its own
+        // funding TX (chicken-and-egg). Use the agent keypair as fee payer
+        // in that case — the agent keypair has SOL from RegisterAgent.
+        const signers: Keypair[] = [this.sessionKeypair];
+        if (sessionBalance < 5_000) {
+            tx.feePayer = this.agentKeypair.publicKey;
+            signers.unshift(this.agentKeypair);
+        } else {
+            tx.feePayer = this.sessionPubkey;
+        }
+
+        tx.sign(...signers);
 
         try {
             const signature = await this.connection.sendRawTransaction(

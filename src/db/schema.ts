@@ -15,6 +15,13 @@
  *  - Soft-delete on bots (deletedAt) — trade history is never destroyed
  *  - On-chain position key for blockchain reconciliation
  *  - setupCompleted flag on users for cross-device state
+ *
+ * ⚠️ SECURITY LIMITATION:
+ *  Agent and session secret keys (agentSecretKey, sessionSecretKey) are stored
+ *  as plaintext base64 in PostgreSQL. For a hackathon demo on devnet, this is
+ *  acceptable. For mainnet production, these MUST be encrypted at rest using
+ *  a MASTER_ENCRYPTION_KEY with chacha20-poly1305 or AES-256-GCM.
+ *  See: https://github.com/nicolo-ribaudo/tc39-proposal-seeded-random
  */
 
 import {

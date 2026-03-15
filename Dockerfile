@@ -44,6 +44,9 @@ COPY --from=builder /app/dist ./dist
 # Copy Drizzle migration files (auto-migrate on startup)
 COPY drizzle/ ./drizzle/
 
+# Copy ML model files (XGBoost JSON, ~150KB)
+COPY models/ ./models/
+
 # Switch to non-root user
 USER sage
 

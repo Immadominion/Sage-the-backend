@@ -13,7 +13,7 @@
     "db:migrate": "drizzle-kit migrate",
     "db:studio": "drizzle-kit studio",
     "db:seed": "tsx src/db/seed.ts",
-    "test": "echo \"No tests yet\" && exit 0"
+    "test": "vitest run"
   },
   "keywords": [
     "solana",
@@ -58,6 +58,7 @@
     "@types/uuid": "^10.0.0",
     "drizzle-kit": "^0.31.9",
     "tsx": "^4.21.0",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.0"
   }
 }

@@ -90,7 +90,8 @@ export type EngineEvent =
   | { type: "scan:completed"; eligible: number; entered: number }
   | { type: "engine:started" }
   | { type: "engine:stopped"; stats: EngineStats }
-  | { type: "engine:error"; error: string };
+  | { type: "engine:error"; error: string }
+  | { type: "engine:warning"; message: string };
 
 export type EngineEventCallback = (event: EngineEvent) => void;
 
@@ -276,17 +277,27 @@ export class TradingEngine {
       }
 
       const balance = await this.executor.getBalance();
-      const minRequired = this.config.minPositionSOL ?? 0.05;
+      // Realistic minimum: position size + rent (~0.06) + tx fees (~0.01)
+      const positionSizeSOL = this.config.positionSizeSOL ?? 0.1;
+      const RENT_AND_FEES = 0.07; // position rent + ATA + tx fees
+      const minRequired = positionSizeSOL + RENT_AND_FEES;
+      const balanceSOL = balance.toNumber() / LAMPORTS_PER_SOL;
 
-      if (balance.toNumber() / LAMPORTS_PER_SOL < minRequired) {
+      if (balanceSOL < minRequired) {
+        const depositNeeded = Math.ceil((minRequired - balanceSOL) * 100) / 100; // round up to 0.01
         log.warn(
           {
             label: this.label,
-            balance: balance.toNumber() / LAMPORTS_PER_SOL,
-            minRequired,
+            balance: balanceSOL.toFixed(4),
+            minRequired: minRequired.toFixed(2),
+            depositNeeded: depositNeeded.toFixed(2),
           },
           "Insufficient balance"
         );
+        this.onEvent({
+          type: "engine:error",
+          error: `insufficient_balance:${balanceSOL.toFixed(6)}:${minRequired.toFixed(2)}:${depositNeeded.toFixed(2)}`,
+        });
         return;
       }
 
@@ -329,11 +340,32 @@ export class TradingEngine {
 
       let topPools: { pool: MeteoraPairData; score: MarketScore; mlPrediction?: MLPrediction; mlFeatures?: V3Features }[] = [];
 
-      if (strategyMode === "sage-ai" && this.mlPredictor?.isEnabled) {
-        // ── Pure ML mode: use ML probability as entry criterion ──
+      if (strategyMode === "sage-ai") {
+        if (!this.mlPredictor?.isEnabled) {
+          log.error(
+            { label: this.label },
+            "sage-ai mode requires ML model but predictor is not available. " +
+            "Bot will not enter positions until model is loaded."
+          );
+          this.onEvent({
+            type: "engine:error",
+            error: "ML model unavailable — sage-ai mode cannot operate without it. " +
+              "Switch to rule-based or ensure model file is deployed.",
+          });
+          return;
+        }
         topPools = await this.scoreWithML(availablePools, slotsAvailable);
-      } else if (strategyMode === "both" && this.mlPredictor?.isEnabled) {
-        // ── Hybrid mode: rule-based filter + ML re-rank ──
+      } else if (strategyMode === "both") {
+        if (!this.mlPredictor?.isEnabled) {
+          log.warn(
+            { label: this.label },
+            "Hybrid mode: ML predictor unavailable, falling back to rule-based scoring"
+          );
+          this.onEvent({
+            type: "engine:warning",
+            message: "ML model unavailable — using rule-based scoring only",
+          });
+        }
         topPools = await this.scoreHybrid(availablePools, slotsAvailable);
       } else {
         // ── Rule-based mode (original) ──
@@ -447,8 +479,15 @@ export class TradingEngine {
     if (!predictions) {
       log.error(
         { label: this.label },
-        "ML prediction failed — skipping scan (sage-ai mode does NOT fall back to rule-based)"
+        "ML prediction failed — skipping this scan cycle. " +
+        "Ensure models/lp_predictor_v3_latest.json is present and valid. " +
+        "sage-ai mode will NOT fall back to rule-based."
       );
+      // Surface the error to the user via bot status so they see it in the app
+      this.onEvent({
+        type: "engine:error",
+        error: "ML model prediction failed. Check server logs for details.",
+      });
       return [];
     }
 
@@ -545,13 +584,18 @@ export class TradingEngine {
     );
 
     if (!predictions) {
-      // ML unavailable — do NOT fall back to pure rule-based.
-      // The user chose hybrid mode; entering without ML approval violates their intent.
-      log.error(
-        { label: this.label },
-        "ML prediction failed — skipping scan (hybrid mode requires ML approval)"
+      // ML unavailable at runtime — fall back to rule-based candidates.
+      // The user chose hybrid mode; we already have rule-based filtered candidates,
+      // so entering those is better than silently skipping the entire scan.
+      log.warn(
+        { label: this.label, ruleCandidates: candidates.length },
+        "ML prediction failed in hybrid mode — using rule-based candidates only"
       );
-      return [];
+      this.onEvent({
+        type: "engine:warning",
+        message: "ML prediction failed this cycle — entered via rule-based scores only",
+      });
+      return candidates.slice(0, slotsAvailable);
     }
 
     // Step 3: Only enter where BOTH agree
@@ -695,6 +739,23 @@ export class TradingEngine {
         { pool: pool.name, error: result.error },
         "Failed to open position"
       );
+
+      // ── FATAL: insufficient balance → stop engine immediately ──
+      // Don't keep scanning if the wallet can't fund any positions.
+      if (result.error?.includes("insufficient_balance")) {
+        log.error(
+          { label: this.label, error: result.error },
+          "Insufficient balance detected — stopping engine to prevent retry spam"
+        );
+        this.onEvent({
+          type: "engine:error",
+          error: result.error,
+        });
+        this.emergencyStop.manualTrigger(
+          `Insufficient balance: ${result.error}`
+        );
+      }
+
       return false;
     } catch (error) {
       log.error(

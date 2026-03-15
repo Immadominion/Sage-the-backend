@@ -16,7 +16,7 @@
  *  - SimulationExecutor per bot instance (virtual balance isolation)
  */
 
-import { Connection } from "@solana/web3.js";
+import { Connection, Keypair, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import BN from "bn.js";
 import config from "../config.js";
 import db from "../db/index.js";
@@ -34,6 +34,8 @@ import { MLPredictor } from "./ml-predictor.js";
 import { EmergencyStop } from "./emergency-stop.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
 import { getSharedCache } from "./shared-cache.js";
+import { deriveWalletPda, deriveAgentPda, deriveSessionPda, SEAL_PROGRAM_ID } from "../services/solana.js";
+import { TransactionSender } from "./transaction-sender.js";
 import type { BotConfig, TrackedPosition, MarketScore, StrategyMode, ITradingExecutor } from "./types.js";
 import { LAMPORTS_PER_SOL } from "./types.js";
 
@@ -77,14 +79,9 @@ export class BotOrchestrator {
 
   private constructor() {
     this.connection = new Connection(config.SOLANA_RPC_URL, "confirmed");
-    this.sharedMLPredictor = new MLPredictor({
-      baseUrl: config.ML_SERVICE_URL ?? "http://127.0.0.1:8100",
-      timeoutMs: 5000,
-      enabled: true,
-      apiKey: config.ML_API_KEY,
-    });
+    this.sharedMLPredictor = new MLPredictor({ enabled: true });
     log.info(
-      { rpc: config.SOLANA_RPC_URL, mlUrl: config.ML_SERVICE_URL ?? "http://127.0.0.1:8100" },
+      { rpc: config.SOLANA_RPC_URL, mlLoaded: this.sharedMLPredictor.isHealthy },
       "BotOrchestrator initialized"
     );
   }
@@ -153,14 +150,14 @@ export class BotOrchestrator {
       const health = await this.sharedMLPredictor.checkHealth();
       if (!health) {
         throw new Error(
-          `ML service is unavailable but strategyMode="${strategyMode}" requires it. ` +
-          `Ensure the ML service is running at ${config.ML_SERVICE_URL ?? "http://127.0.0.1:8100"} ` +
+          `ML model could not be loaded but strategyMode="${strategyMode}" requires it. ` +
+          `Ensure models/lp_predictor_v3_latest.json exists in the project root, ` +
           `or change strategyMode to "rule-based".`
         );
       }
       log.info(
         { botId, model: health.model, threshold: health.threshold },
-        "ML service connected"
+        "ML model ready (in-process)"
       );
     }
 
@@ -248,7 +245,6 @@ export class BotOrchestrator {
       // executeViaSession TXs — no user private key on the server.
 
       // ── Verify Seal program exists on-chain ──
-      const { SEAL_PROGRAM_ID } = await import("../services/solana.js");
       const programInfo = await this.connection.getAccountInfo(SEAL_PROGRAM_ID);
       if (!programInfo) {
         throw new Error(
@@ -259,8 +255,8 @@ export class BotOrchestrator {
 
       if (!botRow.sessionSecretKey || !botRow.agentSecretKey) {
         throw new Error(
-          "Live mode requires Seal agent + session setup. " +
-          "Complete the live setup flow in the app first."
+          "Live mode requires wallet setup — agent and session keys are missing. " +
+          "Tap Start in the app to sign and complete setup."
         );
       }
 
@@ -277,7 +273,8 @@ export class BotOrchestrator {
         throw new Error("User wallet address not found");
       }
 
-      const canonicalWalletAddress = user.sealWalletAddress ?? user.walletAddress;
+      const canonicalWalletAddress = user.sealWalletAddress ??
+        deriveWalletPda(new PublicKey(user.walletAddress))[0].toBase58();
 
       const sealSession = SealSession.fromDb(
         canonicalWalletAddress,
@@ -285,6 +282,115 @@ export class BotOrchestrator {
         botRow.sessionSecretKey,
         this.connection
       );
+
+      // ── Verify on-chain accounts exist before starting engine ──
+      // If the session PDA was never created (e.g. previous CreateSession
+      // failed), auto-finalize it now so the engine doesn't waste scans.
+      const agentAccount = await this.connection.getAccountInfo(sealSession.agentPda);
+      const sessionAccount = await this.connection.getAccountInfo(sealSession.sessionPda);
+
+      if (!agentAccount) {
+        throw new Error(
+          "Live setup incomplete — agent not registered on-chain. " +
+          "Tap Start in the app to re-sign and complete setup."
+        );
+      }
+
+      if (!sessionAccount) {
+        log.warn(
+          { botId, agentPda: sealSession.agentPda.toBase58().slice(0, 8) + "…" },
+          "Session PDA missing on-chain — auto-creating session"
+        );
+
+        const agentKeypair = Keypair.fromSecretKey(
+          Buffer.from(botRow.agentSecretKey, "base64")
+        );
+        const sessionKeypair = Keypair.fromSecretKey(
+          Buffer.from(botRow.sessionSecretKey!, "base64")
+        );
+        const sessionPubkey = new PublicKey(botRow.sessionPubkey!);
+        const walletPda = sealSession.getWalletPda();
+        const [agentPda] = deriveAgentPda(walletPda, agentKeypair.publicKey);
+        const [sessionPda, sessionBump] = deriveSessionPda(
+          walletPda,
+          agentKeypair.publicKey,
+          sessionPubkey
+        );
+
+        const durationSecs = BigInt(7 * 24 * 60 * 60); // 7 days
+        const maxAmountLamports = BigInt(
+          Math.floor((botRow.maxDailyLossSOL ?? 0.5) * LAMPORTS_PER_SOL)
+        );
+        const maxPerTxLamports = BigInt(
+          Math.floor((botRow.positionSizeSOL ?? 0.1) * LAMPORTS_PER_SOL)
+        );
+        const sessionRentLamports = await this.connection.getMinimumBalanceForRentExemption(154);
+        const signerRentLamports = await this.connection.getMinimumBalanceForRentExemption(0);
+        const requiredAgentLamports = sessionRentLamports + signerRentLamports + 500_000;
+        const agentBalanceLamports = await this.connection.getBalance(agentKeypair.publicKey);
+
+        // Build CreateSession instruction inline
+        const csData = Buffer.concat([
+          Buffer.from([2]), // CreateSessionKey discriminant
+          Buffer.from([sessionBump]),
+          sessionPubkey.toBuffer(),
+          encodeI64(durationSecs),
+          encodeU64(maxAmountLamports),
+          encodeU64(maxPerTxLamports),
+        ]);
+
+        const csIx = {
+          programId: SEAL_PROGRAM_ID,
+          keys: [
+            { pubkey: agentKeypair.publicKey, isSigner: true, isWritable: true },
+            { pubkey: walletPda, isSigner: false, isWritable: false },
+            { pubkey: agentPda, isSigner: false, isWritable: false },
+            { pubkey: sessionPda, isSigner: false, isWritable: true },
+            { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+          ],
+          data: csData,
+        };
+
+        // Use session keypair as fee payer — it was funded with 0.01 SOL
+        // during setup. The agent keypair's small balance must stay intact
+        // to pay the session PDA rent via CPI inside CreateSession.
+        const csTx = new Transaction();
+        csTx.feePayer = sessionKeypair.publicKey;
+
+        if (agentBalanceLamports < requiredAgentLamports) {
+          csTx.add(SystemProgram.transfer({
+            fromPubkey: sessionKeypair.publicKey,
+            toPubkey: agentKeypair.publicKey,
+            lamports: requiredAgentLamports - agentBalanceLamports,
+          }));
+        }
+
+        csTx.add(csIx);
+
+        const txSender = new TransactionSender(this.connection);
+        const csTxWithFees = txSender.addPriorityFee(csTx);
+        const csResult = await txSender.sendTransaction(csTxWithFees, [sessionKeypair, agentKeypair]);
+
+        if (!csResult.success || !csResult.signature) {
+          throw new Error(
+            `Failed to auto-create session: ${csResult.error ?? "unknown error"}. ` +
+            "Delete this bot and create a new one, or tap Start in the app."
+          );
+        }
+
+        await db.update(bots)
+          .set({
+            agentConfigAddress: agentPda.toBase58(),
+            sessionAddress: sessionPda.toBase58(),
+            updatedAt: new Date(),
+          })
+          .where(eq(bots.botId, botId));
+
+        log.info(
+          { botId, sessionPda: sessionPda.toBase58().slice(0, 8) + "…", sig: csResult.signature },
+          "Session created on-chain automatically"
+        );
+      }
 
       executor = new SealExecutor(
         this.connection,
@@ -682,6 +788,11 @@ export class BotOrchestrator {
       case "engine:error":
         this.onEngineError(botId, userId, event.error);
         break;
+      case "engine:warning":
+        eventBus.emitBotEvent("engine:warning", botId, userId, {
+          message: event.message,
+        });
+        break;
     }
   }
 
@@ -778,58 +889,63 @@ export class BotOrchestrator {
     pnlLamports: BN
   ): Promise<void> {
     try {
-      // Update position in DB
-      await db.update(positions)
-        .set({
-          status: "closed",
-          exitPricePerToken: position.exitPricePerToken,
-          exitTimestamp: position.exitTimestamp ?? Date.now(),
-          exitReason: position.exitReason,
-          realizedPnlLamports: pnlLamports.toNumber(),
-          feesEarnedXLamports: position.feesEarnedX?.toNumber() ?? 0,
-          feesEarnedYLamports: position.feesEarnedY?.toNumber() ?? 0,
-          txCostLamports:
-            (position.entryTxCostLamports ?? 0) +
-            (position.exitTxCostLamports ?? 0),
-          updatedAt: new Date(),
-        })
-        .where(eq(positions.positionId, position.id));
-
-      // Update bot stats
       const isWin = pnlLamports.gtn(0);
-      const [botRow] = await db.select().from(bots).where(eq(bots.botId, botId));
-      if (botRow) {
-        await db.update(bots)
+      const pnlSol = pnlLamports.toNumber() / LAMPORTS_PER_SOL;
+
+      // Wrap all DB mutations in a transaction for atomicity:
+      // position update + bot stats + trade log must all succeed or all roll back.
+      await db.transaction(async (tx) => {
+        // Update position in DB
+        await tx.update(positions)
           .set({
-            totalTrades: botRow.totalTrades + 1,
-            winningTrades: botRow.winningTrades + (isWin ? 1 : 0),
-            totalPnlLamports:
-              botRow.totalPnlLamports + pnlLamports.toNumber(),
-            lastActivityAt: new Date(),
+            status: "closed",
+            exitPricePerToken: position.exitPricePerToken,
+            exitTimestamp: position.exitTimestamp ?? Date.now(),
+            exitReason: position.exitReason,
+            realizedPnlLamports: pnlLamports.toNumber(),
+            feesEarnedXLamports: position.feesEarnedX?.toNumber() ?? 0,
+            feesEarnedYLamports: position.feesEarnedY?.toNumber() ?? 0,
+            txCostLamports:
+              (position.entryTxCostLamports ?? 0) +
+              (position.exitTxCostLamports ?? 0),
             updatedAt: new Date(),
           })
-          .where(eq(bots.botId, botId));
-      }
+          .where(eq(positions.positionId, position.id));
 
-      // Log to trade_log
-      await db.insert(tradeLog)
-        .values({
-          botId,
-          userId,
-          positionId: position.id,
-          event: "position_closed",
-          details: JSON.stringify({
-            pool: position.poolName,
-            exitPrice: position.exitPricePerToken,
-            reason: position.exitReason,
-            pnlLamports: pnlLamports.toString(),
-            pnlSol: (pnlLamports.toNumber() / LAMPORTS_PER_SOL).toFixed(6),
-            result: isWin ? "WIN" : "LOSS",
-          }),
-        });
+        // Update bot stats
+        const [botRow] = await tx.select().from(bots).where(eq(bots.botId, botId));
+        if (botRow) {
+          await tx.update(bots)
+            .set({
+              totalTrades: botRow.totalTrades + 1,
+              winningTrades: botRow.winningTrades + (isWin ? 1 : 0),
+              totalPnlLamports:
+                botRow.totalPnlLamports + pnlLamports.toNumber(),
+              lastActivityAt: new Date(),
+              updatedAt: new Date(),
+            })
+            .where(eq(bots.botId, botId));
+        }
 
-      // Emit event
-      const pnlSol = pnlLamports.toNumber() / LAMPORTS_PER_SOL;
+        // Log to trade_log
+        await tx.insert(tradeLog)
+          .values({
+            botId,
+            userId,
+            positionId: position.id,
+            event: "position_closed",
+            details: JSON.stringify({
+              pool: position.poolName,
+              exitPrice: position.exitPricePerToken,
+              reason: position.exitReason,
+              pnlLamports: pnlLamports.toString(),
+              pnlSol: pnlSol.toFixed(6),
+              result: isWin ? "WIN" : "LOSS",
+            }),
+          });
+      });
+
+      // Emit event (outside transaction — UI notification is best-effort)
       eventBus.emitBotEvent("position:closed", botId, userId, {
         positionId: position.id,
         pool: position.poolName,
@@ -840,7 +956,6 @@ export class BotOrchestrator {
       });
 
       // Persist EmergencyStop state after trade result is recorded
-      // (the TradingEngine calls emergencyStop.recordTradeResult before emitting this event)
       this.persistEmergencyStopState(botId);
 
       // Persist virtual balance after PnL credit (simulation mode)
@@ -903,13 +1018,11 @@ export class BotOrchestrator {
     eligible: number,
     entered: number
   ): Promise<void> {
-    // Only emit events for scans that resulted in entries
-    if (entered > 0) {
-      eventBus.emitBotEvent("scan:completed", botId, userId, {
-        eligible,
-        entered,
-      });
-    }
+    // Always emit scan events so the app can update stats in real time
+    eventBus.emitBotEvent("scan:completed", botId, userId, {
+      eligible,
+      entered,
+    });
 
     // Update activity timestamp
     await db.update(bots)
@@ -937,6 +1050,37 @@ export class BotOrchestrator {
       .where(eq(bots.botId, botId));
 
     eventBus.emitBotEvent("engine:error", botId, userId, { error });
+
+    // Auto-stop on insufficient balance when no active positions.
+    // Without capital the engine would just retry every scan cycle forever.
+    if (error.startsWith("insufficient_balance")) {
+      const running = this.runningBots.get(botId);
+      if (running) {
+        const active = running.engine.getActivePositions();
+        if (active.length === 0) {
+          log.warn(
+            { botId },
+            "Auto-stopping bot: insufficient balance with no active positions"
+          );
+          try {
+            await this.stopBot(botId);
+          } catch (stopErr) {
+            log.error({ botId, stopErr }, "Failed to auto-stop bot");
+            return;
+          }
+          await db.update(bots)
+            .set({
+              status: "stopped",
+              lastError: `Auto-stopped: ${error}`,
+              updatedAt: new Date(),
+            })
+            .where(eq(bots.botId, botId));
+          eventBus.emitBotEvent("engine:stopped", botId, userId, {
+            reason: "insufficient_balance",
+          });
+        }
+      }
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════
@@ -1029,3 +1173,17 @@ export class BotOrchestrator {
 }
 
 export const orchestrator = BotOrchestrator.getInstance();
+
+// ── Helpers for CreateSession instruction encoding ──
+
+function encodeU64(value: bigint): Buffer {
+  const buf = Buffer.alloc(8);
+  buf.writeBigUInt64LE(value);
+  return buf;
+}
+
+function encodeI64(value: bigint): Buffer {
+  const buf = Buffer.alloc(8);
+  buf.writeBigInt64LE(value);
+  return buf;
+}

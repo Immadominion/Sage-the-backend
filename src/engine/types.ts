@@ -347,6 +347,7 @@ export type BotEventType =
   | "engine:started"
   | "engine:stopped"
   | "engine:error"
+  | "engine:warning"
   | "stats:updated";
 
 export interface BotEvent {
