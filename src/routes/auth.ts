@@ -20,7 +20,7 @@ import {
 import { requireAuth, type AuthVariables } from "../middleware/auth.js";
 import { createApiError } from "../middleware/error.js";
 import db from "../db/index.js";
-import { users } from "../db/schema.js";
+import { users, bots } from "../db/schema.js";
 import { eq } from "drizzle-orm";
 
 const auth = new Hono<{ Variables: AuthVariables }>();
@@ -184,6 +184,10 @@ auth.post(
 /**
  * GET /auth/me
  * Get current authenticated user info.
+ *
+ * Auto-corrects `setupCompleted` for users who already have bots but
+ * whose flag was never set (e.g. created before the column existed, or
+ * the POST /auth/setup-complete call failed on a previous attempt).
  */
 auth.get("/me", requireAuth, async (c) => {
   const walletAddress = c.var.walletAddress;
@@ -206,7 +210,25 @@ auth.get("/me", requireAuth, async (c) => {
     throw createApiError("User not found", 404);
   }
 
-  return c.json({ success: true, user });
+  // Auto-fix: if user has bots but setupCompleted is false, correct it.
+  let setupCompleted = user.setupCompleted;
+  if (!setupCompleted) {
+    const [botRow] = await db
+      .select({ id: bots.id })
+      .from(bots)
+      .where(eq(bots.userId, user.id))
+      .limit(1);
+
+    if (botRow) {
+      await db
+        .update(users)
+        .set({ setupCompleted: true, updatedAt: new Date() })
+        .where(eq(users.id, user.id));
+      setupCompleted = true;
+    }
+  }
+
+  return c.json({ success: true, user: { ...user, setupCompleted } });
 });
 
 // ═══════════════════════════════════════════════════════════════

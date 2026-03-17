@@ -119,6 +119,15 @@ if (parsed.data.NODE_ENV === "production") {
     );
   }
 
+  // Cross-validate network vs RPC URL
+  if (parsed.data.SOLANA_NETWORK === "mainnet-beta") {
+    if (parsed.data.SOLANA_RPC_URL.includes("devnet")) {
+      errors.push(
+        "SOLANA_RPC_URL contains 'devnet' but SOLANA_NETWORK is mainnet-beta — this will connect to the wrong network"
+      );
+    }
+  }
+
   for (const w of warnings) {
     console.warn(`⚠️  ${w}`);
   }
