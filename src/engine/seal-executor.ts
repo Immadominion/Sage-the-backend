@@ -16,6 +16,7 @@
  */
 
 import {
+    ComputeBudgetProgram,
     Connection,
     Keypair,
     LAMPORTS_PER_SOL,
@@ -54,6 +55,9 @@ const DLMM_INITIALIZE_POSITION_DISC = Buffer.from([
 ]);
 const DLMM_INITIALIZE_BIN_ARRAY_DISC = Buffer.from([
     35, 86, 19, 185, 78, 212, 75, 211,
+]);
+const DLMM_ADD_LIQUIDITY_BY_STRATEGY2_DISC = Buffer.from([
+    3, 221, 149, 218, 111, 141, 118, 213,
 ]);
 
 // ═══════════════════════════════════════════════════════════════
@@ -192,6 +196,29 @@ export class SealExecutor implements ITradingExecutor {
         }
 
         return rewritten;
+    }
+
+    private wrapCreatePositionTx(tx: Transaction, amountLamports: bigint): Transaction {
+        const wrapped = new Transaction();
+        wrapped.feePayer = this.session.getSessionKeypair().publicKey;
+
+        for (const ix of tx.instructions) {
+            if (ix.programId.equals(ComputeBudgetProgram.programId)) {
+                wrapped.add(ix);
+                continue;
+            }
+
+            const trackedAmount = this.matchesDiscriminator(
+                ix.data,
+                DLMM_ADD_LIQUIDITY_BY_STRATEGY2_DISC
+            )
+                ? amountLamports
+                : 0n;
+
+            wrapped.add(this.session.wrapInstruction(ix, trackedAmount));
+        }
+
+        return wrapped;
     }
 
     constructor(
@@ -360,7 +387,7 @@ export class SealExecutor implements ITradingExecutor {
             // ── Wrap in executeViaSession ──
             const amountLamports = BigInt(adjTotal);
             await this.session.assertFeePayerFunded();
-            const wrappedTx = this.session.wrapTransaction(delegatedCreateTx, amountLamports);
+            const wrappedTx = this.wrapCreatePositionTx(delegatedCreateTx, amountLamports);
             const txWithFees = this.txSender.addPriorityFee(wrappedTx);
 
             // Sign with session keypair + position keypair
