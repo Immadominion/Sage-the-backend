@@ -1514,12 +1514,13 @@ wallet.post(
       lamports: agentFundingLamports,
     }));
 
-    // 2. Fund session signer with user's deposit (trading capital)
-    // This is the ONLY place the user's deposit goes — directly to the
-    // session signer that actually pays for trading operations.
+    // 2. Deposit trading capital to the wallet PDA.
+    // The engine pre-funds the session signer from the wallet PDA before
+    // each trade via TransferLamports, so capital must live in the PDA —
+    // matching the prepare-deposit flow and getBalance() expectations.
     tx.add(SystemProgram.transfer({
       fromPubkey: funderPubkey,
-      toPubkey: sessionKeypair.publicKey,
+      toPubkey: walletPda,
       lamports: depositLamports,
     }));
 

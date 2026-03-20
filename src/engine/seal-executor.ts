@@ -710,13 +710,17 @@ export class SealExecutor implements ITradingExecutor {
     }
 
     async getBalance(): Promise<BN> {
-        // Return wallet PDA balance — this is the user's actual trading capital.
-        // The session signer is pre-funded from the wallet PDA before each trade
-        // via the TransferLamports instruction.
-        const walletBalance = await this.connection.getBalance(
-            this.session.getWalletPda()
-        );
-        return new BN(walletBalance);
+        // Sum wallet PDA + session signer balances.
+        // New deposits go to the wallet PDA (setup-live and prepare-deposit
+        // both target the PDA). The session signer fallback covers legacy
+        // deposits that went directly to the signer before the fix.
+        const [walletBalance, sessionBalance] = await Promise.all([
+            this.connection.getBalance(this.session.getWalletPda()),
+            this.connection.getBalance(
+                this.session.getSessionKeypair().publicKey
+            ),
+        ]);
+        return new BN(walletBalance + sessionBalance);
     }
 
     getPerformanceSummary(): {
