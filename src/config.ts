@@ -16,8 +16,10 @@ const envSchema = z.object({
     .enum(["development", "production", "test"])
     .default("development"),
   SOLANA_NETWORK: z
-    .enum(["mainnet-beta", "devnet", "localnet"])
-    .default("devnet"),
+    .string()
+    .default("devnet")
+    .transform((v) => (v === "mainnet" ? "mainnet-beta" : v))
+    .pipe(z.enum(["mainnet-beta", "devnet", "localnet"])),
   SOLANA_RPC_URL: z.string().url().default("https://api.devnet.solana.com"),
   SEAL_PROGRAM_ID: z.string().min(32).max(50).default("EV3TKRVz7pTHpAqBTjP8jmwuvoRBRCpjmVSPHhcMnXqb"),
   SEAL_ALLOWED_PROGRAMS: z

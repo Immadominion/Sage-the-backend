@@ -101,6 +101,8 @@ app.use("*", honoLogger());
 app.onError(errorHandler);
 
 // ── Per-route rate limits ──
+// setup-progress is called frequently during wizard slider drags — use bot lifecycle limit, not strict auth
+app.use("/auth/setup-progress", botLifecycleRateLimit);
 app.use("/auth/*", authRateLimit);
 app.use("/bot/create", botLifecycleRateLimit);
 app.use("/bot/*/start", botLifecycleRateLimit);
