@@ -18,7 +18,7 @@ import type {
   MeteoraPairData,
   MarketScore,
 } from "./types.js";
-import { StrategyType, LAMPORTS_PER_SOL } from "./types.js";
+import { StrategyType, LAMPORTS_PER_SOL, SOL_MINT } from "./types.js";
 import { MLPredictor, type MLPrediction } from "./ml-predictor.js";
 import {
   extractV3Features,
@@ -669,11 +669,20 @@ export class TradingEngine {
         strategyType: StrategyType.Spot,
       };
 
-      const amountY = calculatePositionSize(
+      // Determine which pool side is SOL so the DLMM SDK generates
+      // the correct wrapping instructions (SystemProgram.transfer + SyncNative).
+      const positionSize = calculatePositionSize(
         this.config,
         await this.executor.getBalance()
       );
-      const amountX = new BN(0); // One-sided SOL deposit
+      const solIsX = pool.mint_x === SOL_MINT;
+      const solIsY = pool.mint_y === SOL_MINT;
+      if (!solIsX && !solIsY) {
+        log.warn({ pool: pool.name, mint_x: pool.mint_x, mint_y: pool.mint_y }, "Neither token is SOL — skipping");
+        return false;
+      }
+      const amountX = solIsX ? positionSize : new BN(0);
+      const amountY = solIsY ? positionSize : new BN(0);
 
       // ── SAFETY CHECK: Circuit Breaker ──
       const totalAmount = amountX.add(amountY);
