@@ -319,6 +319,12 @@ export class SealExecutor implements ITradingExecutor {
                 const has = (walletBalance / LAMPORTS_PER_SOL).toFixed(4);
                 const needs = (sessionNeeded / LAMPORTS_PER_SOL).toFixed(2);
                 const depositNeeded = (Math.ceil((sessionNeeded - walletBalance) / 10_000_000) / 100).toFixed(2);
+
+                // Only report insufficient_balance when wallet PDA truly can't cover it.
+                // Fund TX can fail for transient reasons (RPC timeout, agent broke for fees).
+                // Reporting insufficient_balance triggers emergency stop — don't false-positive.
+                const walletActuallyShort = walletBalance < sessionNeeded;
+
                 log.warn(
                     {
                         walletBalance: has,
@@ -326,12 +332,23 @@ export class SealExecutor implements ITradingExecutor {
                         depositNeeded,
                         positionSizeSOL: (requestedTotal / LAMPORTS_PER_SOL).toFixed(4),
                         fundError: fundResult.error,
+                        walletActuallyShort,
                     },
-                    "Cannot pre-fund session — insufficient wallet PDA balance"
+                    walletActuallyShort
+                      ? "Cannot pre-fund session — insufficient wallet PDA balance"
+                      : "Cannot pre-fund session — transfer TX failed (transient)"
                 );
+
+                if (walletActuallyShort) {
+                    return {
+                        success: false,
+                        error: `insufficient_balance:${has}:${needs}:${depositNeeded}`,
+                    };
+                }
+                // Transient failure — return a non-fatal error so the engine retries next scan
                 return {
                     success: false,
-                    error: `insufficient_balance:${has}:${needs}:${depositNeeded}`,
+                    error: `fund_transfer_failed:${fundResult.error ?? "unknown"}`,
                 };
             }
 

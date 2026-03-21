@@ -842,33 +842,16 @@ async function finalizeLiveSession(opts: {
     BigInt(Math.floor(opts.maxPerTxSol * LAMPORTS_PER_SOL))
   );
 
-  const sessionRentLamports = await withRpcRetry(() =>
-    connection.getMinimumBalanceForRentExemption(154) // SessionKey::SIZE
-  );
-  const signerRentLamports = await withRpcRetry(() =>
-    connection.getMinimumBalanceForRentExemption(0)
-  );
-  const requiredAgentLamports = sessionRentLamports + signerRentLamports + 500_000;
-  const agentBalanceLamports = await withRpcRetry(() =>
-    connection.getBalance(agentPubkey)
-  );
-
   const tx = new Transaction();
-  tx.feePayer = sessionKeypair.publicKey;
-
-  if (agentBalanceLamports < requiredAgentLamports) {
-    tx.add(SystemProgram.transfer({
-      fromPubkey: sessionKeypair.publicKey,
-      toPubkey: agentPubkey,
-      lamports: requiredAgentLamports - agentBalanceLamports,
-    }));
-  }
+  // Agent is fee payer — it was funded during setup-live with enough SOL
+  // for session PDA rent + fees. The session signer has 0 SOL at this point.
+  tx.feePayer = agentKeypair.publicKey;
 
   tx.add(createSessionIx);
 
   const txSender = new TransactionSender(connection);
   const txWithFees = txSender.addPriorityFee(tx);
-  const result = await txSender.sendTransaction(txWithFees, [sessionKeypair, agentKeypair]);
+  const result = await txSender.sendTransaction(txWithFees, [agentKeypair, sessionKeypair]);
 
   if (!result.success || !result.signature) {
     throw createApiError(
