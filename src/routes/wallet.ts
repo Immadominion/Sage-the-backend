@@ -418,26 +418,39 @@ wallet.get("/balance", requireAuth, async (c) => {
   // New deposits go to the wallet PDA; the backend pre-funds the 
   // session signer on-demand via TransferLamports before each trade.
   let sessionLamports = 0;
+  let agentLamports = 0;
   try {
-    const sessionRows = await db
-      .select({ sessionPubkey: bots.sessionPubkey })
+    const botRows = await db
+      .select({
+        sessionPubkey: bots.sessionPubkey,
+        agentPubkey: bots.agentPubkey,
+      })
       .from(bots)
       .where(and(
         eq(bots.userId, userId),
         eq(bots.mode, "live"),
-        isNotNull(bots.sessionPubkey),
       ));
-    const seen = new Set<string>();
-    for (const row of sessionRows) {
-      if (!row.sessionPubkey || seen.has(row.sessionPubkey)) continue;
-      seen.add(row.sessionPubkey);
-      try {
-        sessionLamports += await connection.getBalance(new PublicKey(row.sessionPubkey));
-      } catch { /* skip invalid keys */ }
+    const seenSession = new Set<string>();
+    const seenAgent = new Set<string>();
+    for (const row of botRows) {
+      // Session signer balances
+      if (row.sessionPubkey && !seenSession.has(row.sessionPubkey)) {
+        seenSession.add(row.sessionPubkey);
+        try {
+          sessionLamports += await connection.getBalance(new PublicKey(row.sessionPubkey));
+        } catch { /* skip invalid keys */ }
+      }
+      // Agent balances (small — mostly rent residuals)
+      if (row.agentPubkey && !seenAgent.has(row.agentPubkey)) {
+        seenAgent.add(row.agentPubkey);
+        try {
+          agentLamports += await connection.getBalance(new PublicKey(row.agentPubkey));
+        } catch { /* skip invalid keys */ }
+      }
     }
   } catch { /* ignore */ }
 
-  const totalLamports = walletLamports + sessionLamports;
+  const totalLamports = walletLamports + sessionLamports + agentLamports;
 
   return c.json({
     success: true,
@@ -445,6 +458,7 @@ wallet.get("/balance", requireAuth, async (c) => {
     sol: totalLamports / LAMPORTS_PER_SOL,
     walletLamports,
     sessionLamports,
+    agentLamports,
   });
 });
 
