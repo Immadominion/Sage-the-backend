@@ -39,6 +39,8 @@ const createBotSchema = z.object({
   strategyMode: z.enum(["rule-based", "sage-ai", "both"]).default("rule-based"),
   // Entry criteria
   entryScoreThreshold: z.number().positive().default(150),
+  /** ML probability threshold override (0-1). Omit to use model default. */
+  mlThreshold: z.number().min(0).max(1).optional(),
   minVolume24h: z.number().nonnegative().default(1000),
   minLiquidity: z.number().nonnegative().default(100),
   maxLiquidity: z.number().positive().default(1_000_000),
@@ -159,6 +161,7 @@ bot.post("/create", zValidator("json", createBotSchema), async (c) => {
       mode: body.mode,
       strategyMode: body.strategyMode,
       entryScoreThreshold: body.entryScoreThreshold,
+      mlThreshold: body.mlThreshold ?? null,
       minVolume24h: body.minVolume24h,
       minLiquidity: body.minLiquidity,
       maxLiquidity: body.maxLiquidity,

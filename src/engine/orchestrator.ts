@@ -1098,6 +1098,7 @@ export class BotOrchestrator {
 
       // Entry criteria
       entryScoreThreshold: row.entryScoreThreshold,
+      mlThreshold: row.mlThreshold ?? undefined,
       minVolume24h: row.minVolume24h,
       minLiquidity: row.minLiquidity,
       maxLiquidity: row.maxLiquidity,

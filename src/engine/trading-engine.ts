@@ -452,13 +452,17 @@ export class TradingEngine {
 
   /**
    * Pure ML scoring — uses XGBoost probability as the sole entry criterion.
-   * Pools above the optimal threshold (0.8845) get entered.
+   * Pools above the ML threshold get entered.
+   * Uses per-bot mlThreshold if set, otherwise falls back to the model's default (0.8845).
    */
   private async scoreWithML(
     pools: MeteoraPairData[],
     slotsAvailable: number
   ): Promise<{ pool: MeteoraPairData; score: MarketScore; mlPrediction?: MLPrediction; mlFeatures?: V3Features }[]> {
     if (!this.mlPredictor) return [];
+
+    // Per-bot threshold override — allows tuning aggressiveness without retraining
+    const mlThreshold = this.config.mlThreshold;
 
     // Extract features from top 30 pools (by raw volume, as a cheap pre-filter)
     const sortedByVolume = [...pools]
@@ -491,12 +495,16 @@ export class TradingEngine {
       return [];
     }
 
-    // Combine with market scores and filter by ML recommendation
+    // Combine with market scores and filter by ML probability
     const results: { pool: MeteoraPairData; score: MarketScore; mlPrediction?: MLPrediction; mlFeatures?: V3Features }[] = [];
 
     for (let i = 0; i < featureData.length; i++) {
       const pred = predictions[i];
-      if (pred.recommendation !== "enter") continue;
+      // Use per-bot threshold if set, otherwise respect the model's built-in recommendation
+      const passes = mlThreshold != null
+        ? pred.probability >= mlThreshold
+        : pred.recommendation === "enter";
+      if (!passes) continue;
 
       const score = await this.marketData.calculateMarketScore(featureData[i].pool);
       results.push({
@@ -505,6 +513,37 @@ export class TradingEngine {
         mlPrediction: pred,
         mlFeatures: featureData[i].features,
       });
+    }
+
+    if (results.length > 0) {
+      log.info(
+        {
+          label: this.label,
+          mode: "sage-ai",
+          candidates: results.length,
+          threshold: mlThreshold ?? "model-default",
+          topProb: results[0]?.mlPrediction?.probability,
+          topPool: results[0]?.pool.name,
+        },
+        "ML entry candidates found"
+      );
+    } else {
+      const topPreds = predictions
+        .sort((a, b) => b.probability - a.probability)
+        .slice(0, 3);
+      log.debug(
+        {
+          label: this.label,
+          mode: "sage-ai",
+          threshold: mlThreshold ?? "model-default",
+          poolsEvaluated: predictions.length,
+          bestProbs: topPreds.map((p) => ({
+            pool: featureData.find((d) => d.pool.address === p.poolAddress)?.pool.name,
+            prob: p.probability.toFixed(4),
+          })),
+        },
+        "No pools met ML threshold"
+      );
     }
 
     // Rank by ML probability (highest first)

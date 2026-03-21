@@ -112,6 +112,8 @@ export const bots = pgTable(
     entryScoreThreshold: doublePrecision("entry_score_threshold")
       .notNull()
       .default(150),
+    /** ML probability threshold override for sage-ai mode (0-1). Null = use model default. */
+    mlThreshold: doublePrecision("ml_threshold"),
     minVolume24h: doublePrecision("min_volume_24h").notNull().default(1000),
     minLiquidity: doublePrecision("min_liquidity").notNull().default(100),
     maxLiquidity: doublePrecision("max_liquidity")

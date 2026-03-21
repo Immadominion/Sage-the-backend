@@ -237,6 +237,8 @@ export interface BotConfig {
 
   // Entry criteria
   entryScoreThreshold: number;
+  /** ML probability threshold override (0-1). Undefined = use model default (0.8845). */
+  mlThreshold?: number;
   minVolume24h: number;
   minLiquidity: number;
   maxLiquidity: number;
