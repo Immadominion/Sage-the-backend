@@ -1,9 +1,8 @@
 /**
- * Solana connection service + Seal PDA derivation.
- * Ported from seal/backend/src/services/solana.ts
+ * Solana connection service.
  */
 
-import { Connection, PublicKey } from "@solana/web3.js";
+import { Connection } from "@solana/web3.js";
 import config from "../config.js";
 
 // ═══════════════════════════════════════════════════════════════
@@ -62,46 +61,4 @@ export async function withRpcRetry<T>(
     }
   }
   throw lastError;
-}
-
-export const SEAL_PROGRAM_ID = new PublicKey(config.SEAL_PROGRAM_ID);
-
-// ═══════════════════════════════════════════════════════════════
-// PDA Derivation
-// ═══════════════════════════════════════════════════════════════
-
-/** Derive SmartWallet PDA: seeds = ["seal", owner_pubkey] */
-export function deriveWalletPda(owner: PublicKey): [PublicKey, number] {
-  return PublicKey.findProgramAddressSync(
-    [Buffer.from("seal"), owner.toBuffer()],
-    SEAL_PROGRAM_ID
-  );
-}
-
-/** Derive AgentConfig PDA: seeds = ["agent", wallet_pubkey, agent_pubkey] */
-export function deriveAgentPda(
-  wallet: PublicKey,
-  agent: PublicKey
-): [PublicKey, number] {
-  return PublicKey.findProgramAddressSync(
-    [Buffer.from("agent"), wallet.toBuffer(), agent.toBuffer()],
-    SEAL_PROGRAM_ID
-  );
-}
-
-/** Derive SessionKey PDA: seeds = ["session", wallet_pubkey, agent_pubkey, session_pubkey] */
-export function deriveSessionPda(
-  wallet: PublicKey,
-  agent: PublicKey,
-  sessionPubkey: PublicKey
-): [PublicKey, number] {
-  return PublicKey.findProgramAddressSync(
-    [
-      Buffer.from("session"),
-      wallet.toBuffer(),
-      agent.toBuffer(),
-      sessionPubkey.toBuffer(),
-    ],
-    SEAL_PROGRAM_ID
-  );
 }

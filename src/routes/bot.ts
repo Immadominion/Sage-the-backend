@@ -16,8 +16,9 @@ import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
 import crypto from "node:crypto";
 import { createApiError } from "../middleware/error.js";
+import { generateEncryptedKeypair } from "../engine/crypto-utils.js";
 import db from "../db/index.js";
-import { bots, positions, tradeLog } from "../db/schema.js";
+import { bots, users, positions, tradeLog } from "../db/schema.js";
 import { eq, and, sql, isNull } from "drizzle-orm";
 import { orchestrator } from "../engine/orchestrator.js";
 import { requireAuth, type AuthVariables } from "../middleware/auth.js";
@@ -89,10 +90,10 @@ async function getUserBot(userId: number, botId: string) {
   return row;
 }
 
-/** Strip secret keys from bot data before sending to the client. */
-function sanitizeBot<T extends Record<string, unknown>>(bot: T): Omit<T, 'agentSecretKey' | 'sessionSecretKey'> {
-  const { agentSecretKey, sessionSecretKey, ...safe } = bot;
-  return safe as Omit<T, 'agentSecretKey' | 'sessionSecretKey'>;
+/** Strip encrypted private key from bot data before sending to the client. */
+function sanitizeBot<T extends Record<string, unknown>>(bot: T): Omit<T, 'encryptedPrivateKey'> {
+  const { encryptedPrivateKey, ...safe } = bot;
+  return safe as Omit<T, 'encryptedPrivateKey'>;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -153,12 +154,34 @@ bot.post("/create", zValidator("json", createBotSchema), async (c) => {
 
   const botId = generateBotId();
 
+  // For live bots, generate a dedicated encrypted keypair
+  let walletAddress: string | undefined;
+  let encryptedPrivateKey: string | undefined;
+  let ownerWallet: string | undefined;
+
+  if (body.mode === "live") {
+    const { publicKey, encryptedSecret } = generateEncryptedKeypair(
+      config.MASTER_ENCRYPTION_KEY
+    );
+    walletAddress = publicKey;
+    encryptedPrivateKey = encryptedSecret;
+    // ownerWallet is the user's MWA-verified wallet address
+    const [user] = await db
+      .select({ walletAddress: users.walletAddress })
+      .from(users)
+      .where(eq(users.id, userId));
+    ownerWallet = user?.walletAddress;
+  }
+
   await db.insert(bots)
     .values({
       botId,
       userId,
       name: botName,
       mode: body.mode,
+      walletAddress: walletAddress ?? null,
+      encryptedPrivateKey: encryptedPrivateKey ?? null,
+      ownerWallet: ownerWallet ?? null,
       strategyMode: body.strategyMode,
       entryScoreThreshold: body.entryScoreThreshold,
       mlThreshold: body.mlThreshold ?? null,
@@ -213,8 +236,8 @@ bot.get("/list", async (c) => {
     if (performanceSummary) {
       currentBalanceSol = performanceSummary.currentBalanceSol;
     } else if (b.mode === 'live') {
-      // Live bots: actual capital lives on-chain in the Seal wallet,
-      // not in a virtual balance. Show 0 until the engine reports real P&L.
+      // Live bots: capital lives in the bot's dedicated wallet.
+      // Show 0 until the engine reports real balance.
       currentBalanceSol = 0;
     } else if (b.currentVirtualBalanceLamports != null) {
       currentBalanceSol = b.currentVirtualBalanceLamports / LAMPORTS_PER_SOL;
@@ -599,16 +622,13 @@ bot.delete("/:botId", async (c) => {
       .where(and(eq(bots.botId, botId), eq(bots.userId, userId)));
   }
 
-  // ── Auto-withdraw NOT possible ──
-  // SystemProgram.transfer from a Seal wallet PDA always fails because
-  // the PDA is owned by the Seal program, not SystemProgram.
-  // Users must manually recover funds via the wallet recovery flow
-  // (DeregisterAgent + CloseWallet) before or after deleting a bot.
+  // ── Auto-withdraw on delete ──
+  // For live bots, remaining funds stay in the bot wallet.
+  // The user should withdraw via /wallet/withdraw/:botId before deleting.
+  // We keep the encrypted key so withdrawal is possible even after soft-delete.
   let withdrawResult: { signature?: string; withdrawnSol?: number } = {};
 
   // Soft-delete: preserve trade history forever.
-  // Keep agent/session secret keys so the user can still withdraw funds
-  // if auto-withdraw failed.
   await db.update(bots)
     .set({
       deletedAt: new Date(),

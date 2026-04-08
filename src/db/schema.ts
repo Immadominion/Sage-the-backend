@@ -3,7 +3,7 @@
  *
  * Tables:
  *  - users: wallet-authenticated users
- *  - bots: per-user bot instances with config
+ *  - bots: per-user bot instances with config + encrypted wallet keypairs
  *  - positions: tracked LP positions (active + historical)
  *  - trade_log: individual trade entries (append-only event log)
  *  - strategy_presets: system + user-defined strategy templates
@@ -16,12 +16,11 @@
  *  - On-chain position key for blockchain reconciliation
  *  - setupCompleted flag on users for cross-device state
  *
- * ⚠️ SECURITY LIMITATION:
- *  Agent and session secret keys (agentSecretKey, sessionSecretKey) are stored
- *  as plaintext base64 in PostgreSQL. For a hackathon demo on devnet, this is
- *  acceptable. For mainnet production, these MUST be encrypted at rest using
- *  a MASTER_ENCRYPTION_KEY with chacha20-poly1305 or AES-256-GCM.
- *  See: https://github.com/nicolo-ribaudo/tc39-proposal-seeded-random
+ * Security:
+ *  Bot private keys are encrypted at rest with AES-256-GCM.
+ *  The master encryption key lives in MASTER_ENCRYPTION_KEY env var,
+ *  never in the database. Keys are only decrypted in-memory during
+ *  active trading and zeroized on bot stop.
  */
 
 import {
@@ -48,8 +47,6 @@ export const users = pgTable(
     id: serial("id").primaryKey(),
     /** Solana wallet address (base58, ~44 chars) — the user's identity */
     walletAddress: text("wallet_address").notNull().unique(),
-    /** Seal smart wallet PDA (derived from walletAddress) */
-    sealWalletAddress: text("seal_wallet_address"),
     /** Display name (optional) */
     displayName: text("display_name"),
     /** Has user completed setup wizard? (cross-device flag) */
@@ -181,42 +178,24 @@ export const bots = pgTable(
     /** Serialized EmergencyStop state JSON — survives server restarts */
     emergencyStopState: text("emergency_stop_state"),
 
-    // ── Seal Agent (per-bot wallet isolation, live mode only) ──
+    // ── Bot Wallet (per-bot fund isolation, live mode only) ──
     /**
-     * Public key of the agent registered on the user's Seal wallet.
-     * Each live-mode bot has its own agent with scoped spending limits.
-     * Null for simulation-mode bots or if agent not yet registered.
+     * Solana public key of this bot's dedicated wallet.
+     * Each live-mode bot gets its own keypair for fund isolation.
+     * Null for simulation-mode bots.
      */
-    agentPubkey: text("agent_pubkey"),
+    walletAddress: text("wallet_address"),
     /**
-     * Base64-encoded 64-byte agent keypair (seed + pubkey).
-     * Generated server-side so the backend can sign CreateSession TXs.
-     * ⚠️ SENSITIVE — should be encrypted at rest in production.
+     * AES-256-GCM encrypted private key (base64).
+     * Decrypted in-memory only during active trading.
+     * Master key stored in env MASTER_ENCRYPTION_KEY, never in DB.
      */
-    agentSecretKey: text("agent_secret_key"),
+    encryptedPrivateKey: text("encrypted_private_key"),
     /**
-     * PDA of the AgentConfig account on-chain.
-     * Derived from: seeds = ["agent", wallet_pda, agent_pubkey].
+     * Owner's MWA wallet address — withdrawal whitelist.
+     * Funds can ONLY be withdrawn to this address.
      */
-    agentConfigAddress: text("agent_config_address"),
-    /**
-     * PDA of the active SessionKey account for this bot's agent.
-     * Created on bot start (live mode), revoked on bot stop.
-     * Null when bot is stopped or session hasn't been created yet.
-     */
-    sessionAddress: text("session_address"),
-    /**
-     * Public key of the ephemeral session signing key.
-     * This is the key that signs executeViaSession transactions —
-     * distinct from sessionAddress which is the on-chain PDA.
-     */
-    sessionPubkey: text("session_pubkey"),
-    /**
-     * Base64-encoded 64-byte session keypair (seed + pubkey).
-     * Generated server-side so the orchestrator can sign trades.
-     * ⚠️ SENSITIVE — should be encrypted at rest in production.
-     */
-    sessionSecretKey: text("session_secret_key"),
+    ownerWallet: text("owner_wallet"),
 
     // ── Soft Delete ──
     /** Null = active. Set = soft-deleted. Trade history preserved forever. */

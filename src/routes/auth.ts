@@ -107,7 +107,6 @@ auth.post("/verify", zValidator("json", verifySchema), async (c) => {
       .select({
         id: users.id,
         walletAddress: users.walletAddress,
-        sealWalletAddress: users.sealWalletAddress,
         displayName: users.displayName,
         setupCompleted: users.setupCompleted,
         execMode: users.execMode,
@@ -196,7 +195,6 @@ auth.get("/me", requireAuth, async (c) => {
     .select({
       id: users.id,
       walletAddress: users.walletAddress,
-      sealWalletAddress: users.sealWalletAddress,
       displayName: users.displayName,
       setupCompleted: users.setupCompleted,
       execMode: users.execMode,

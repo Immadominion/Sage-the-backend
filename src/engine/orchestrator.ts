@@ -16,26 +16,22 @@
  *  - SimulationExecutor per bot instance (virtual balance isolation)
  */
 
-import { Connection, Keypair, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
+import { Connection } from "@solana/web3.js";
 import BN from "bn.js";
 import config from "../config.js";
 import db from "../db/index.js";
-import { bots, positions, tradeLog, users } from "../db/schema.js";
+import { bots, positions, tradeLog } from "../db/schema.js";
 import { eq, and } from "drizzle-orm";
 import { logger } from "../middleware/logger.js";
 import { eventBus } from "./event-bus.js";
 import { TradingEngine, type EngineEvent, type EngineStats } from "./trading-engine.js";
 import { SimulationExecutor } from "./simulation-executor.js";
-import { SealExecutor } from "./seal-executor.js";
-import { SealSession } from "./seal-session.js";
-import { WalletManager } from "./wallet-manager.js";
+import { BotKeypairExecutor } from "./bot-keypair-executor.js";
 import { MarketDataProvider } from "./market-data.js";
 import { MLPredictor } from "./ml-predictor.js";
 import { EmergencyStop } from "./emergency-stop.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
 import { getSharedCache } from "./shared-cache.js";
-import { deriveWalletPda, deriveAgentPda, deriveSessionPda, SEAL_PROGRAM_ID } from "../services/solana.js";
-import { TransactionSender } from "./transaction-sender.js";
 import type { BotConfig, TrackedPosition, MarketScore, StrategyMode, ITradingExecutor } from "./types.js";
 import { LAMPORTS_PER_SOL } from "./types.js";
 
@@ -54,7 +50,6 @@ interface RunningBot {
   mlPredictor: MLPredictor | null;
   emergencyStop: EmergencyStop;
   circuitBreaker: CircuitBreaker;
-  walletManager?: WalletManager;
   startedAt: number;
 }
 
@@ -236,178 +231,35 @@ export class BotOrchestrator {
 
     // ── Create executor: Live or Simulation ──
     let executor: ITradingExecutor;
-    let walletManager: WalletManager | undefined;
 
     if (isLiveMode) {
-      // LIVE MODE — Seal session-key execution
-      // The bot's agent + session keypairs are generated at setup-live time
-      // and stored (encrypted) in the DB. The session keypair signs all
-      // executeViaSession TXs — no user private key on the server.
+      // LIVE MODE — Server-side encrypted keypair execution.
+      // Each bot has its own Solana keypair, encrypted at rest with
+      // AES-256-GCM. The keypair is decrypted in-memory only while running.
 
-      // ── Verify Seal program exists on-chain ──
-      const programInfo = await this.connection.getAccountInfo(SEAL_PROGRAM_ID);
-      if (!programInfo) {
+      if (!botRow.encryptedPrivateKey) {
         throw new Error(
-          `Seal wallet program (${SEAL_PROGRAM_ID.toBase58()}) not found on ${config.SOLANA_NETWORK}. ` +
-          `Deploy the Seal program to ${config.SOLANA_NETWORK} before starting live mode.`
+          "Live mode requires a wallet keypair — encryptedPrivateKey is missing. " +
+          "Delete this bot and create a new one."
         );
       }
 
-      if (!botRow.sessionSecretKey || !botRow.agentSecretKey) {
-        throw new Error(
-          "Live mode requires wallet setup — agent and session keys are missing. " +
-          "Tap Start in the app to sign and complete setup."
-        );
-      }
-
-      // Look up the user's main wallet address (to derive wallet PDA)
-      const [user] = await db
-        .select({
-          walletAddress: users.walletAddress,
-          sealWalletAddress: users.sealWalletAddress,
-        })
-        .from(users)
-        .where(eq(users.id, userId));
-
-      if (!user?.walletAddress) {
-        throw new Error("User wallet address not found");
-      }
-
-      const canonicalWalletAddress = user.sealWalletAddress ??
-        deriveWalletPda(new PublicKey(user.walletAddress))[0].toBase58();
-
-      const sealSession = SealSession.fromDb(
-        canonicalWalletAddress,
-        botRow.agentSecretKey,
-        botRow.sessionSecretKey,
-        this.connection
-      );
-
-      // ── Verify on-chain accounts exist before starting engine ──
-      // If the session PDA was never created (e.g. previous CreateSession
-      // failed), auto-finalize it now so the engine doesn't waste scans.
-      const agentAccount = await this.connection.getAccountInfo(sealSession.agentPda);
-      const sessionAccount = await this.connection.getAccountInfo(sealSession.sessionPda);
-
-      if (!agentAccount) {
-        throw new Error(
-          "Live setup incomplete — agent not registered on-chain. " +
-          "Tap Start in the app to re-sign and complete setup."
-        );
-      }
-
-      if (!sessionAccount) {
-        log.warn(
-          { botId, agentPda: sealSession.agentPda.toBase58().slice(0, 8) + "…" },
-          "Session PDA missing on-chain — auto-creating session"
-        );
-
-        const agentKeypair = Keypair.fromSecretKey(
-          Buffer.from(botRow.agentSecretKey, "base64")
-        );
-        const sessionKeypair = Keypair.fromSecretKey(
-          Buffer.from(botRow.sessionSecretKey!, "base64")
-        );
-        const sessionPubkey = new PublicKey(botRow.sessionPubkey!);
-        const walletPda = sealSession.getWalletPda();
-        const [agentPda] = deriveAgentPda(walletPda, agentKeypair.publicKey);
-        const [sessionPda, sessionBump] = deriveSessionPda(
-          walletPda,
-          agentKeypair.publicKey,
-          sessionPubkey
-        );
-
-        const durationSecs = BigInt(7 * 24 * 60 * 60); // 7 days
-        const maxAmountLamports = BigInt(
-          Math.floor((botRow.maxDailyLossSOL ?? 0.5) * LAMPORTS_PER_SOL)
-        );
-        const maxPerTxLamports = BigInt(
-          Math.floor((botRow.positionSizeSOL ?? 0.1) * LAMPORTS_PER_SOL)
-        );
-        const sessionRentLamports = await this.connection.getMinimumBalanceForRentExemption(154);
-        const signerRentLamports = await this.connection.getMinimumBalanceForRentExemption(0);
-        const requiredAgentLamports = sessionRentLamports + signerRentLamports + 500_000;
-        const agentBalanceLamports = await this.connection.getBalance(agentKeypair.publicKey);
-
-        // Build CreateSession instruction inline
-        const csData = Buffer.concat([
-          Buffer.from([2]), // CreateSessionKey discriminant
-          Buffer.from([sessionBump]),
-          sessionPubkey.toBuffer(),
-          encodeI64(durationSecs),
-          encodeU64(maxAmountLamports),
-          encodeU64(maxPerTxLamports),
-        ]);
-
-        const csIx = {
-          programId: SEAL_PROGRAM_ID,
-          keys: [
-            { pubkey: agentKeypair.publicKey, isSigner: true, isWritable: true },
-            { pubkey: walletPda, isSigner: false, isWritable: false },
-            { pubkey: agentPda, isSigner: false, isWritable: false },
-            { pubkey: sessionPda, isSigner: false, isWritable: true },
-            { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-          ],
-          data: csData,
-        };
-
-        // Use session keypair as fee payer — it was funded with 0.01 SOL
-        // during setup. The agent keypair's small balance must stay intact
-        // to pay the session PDA rent via CPI inside CreateSession.
-        const csTx = new Transaction();
-        csTx.feePayer = sessionKeypair.publicKey;
-
-        if (agentBalanceLamports < requiredAgentLamports) {
-          csTx.add(SystemProgram.transfer({
-            fromPubkey: sessionKeypair.publicKey,
-            toPubkey: agentKeypair.publicKey,
-            lamports: requiredAgentLamports - agentBalanceLamports,
-          }));
-        }
-
-        csTx.add(csIx);
-
-        const txSender = new TransactionSender(this.connection);
-        const csTxWithFees = txSender.addPriorityFee(csTx);
-        const csResult = await txSender.sendTransaction(csTxWithFees, [sessionKeypair, agentKeypair]);
-
-        if (!csResult.success || !csResult.signature) {
-          throw new Error(
-            `Failed to auto-create session: ${csResult.error ?? "unknown error"}. ` +
-            "Delete this bot and create a new one, or tap Start in the app."
-          );
-        }
-
-        await db.update(bots)
-          .set({
-            agentConfigAddress: agentPda.toBase58(),
-            sessionAddress: sessionPda.toBase58(),
-            updatedAt: new Date(),
-          })
-          .where(eq(bots.botId, botId));
-
-        log.info(
-          { botId, sessionPda: sessionPda.toBase58().slice(0, 8) + "…", sig: csResult.signature },
-          "Session created on-chain automatically"
-        );
-      }
-
-      executor = new SealExecutor(
+      executor = new BotKeypairExecutor(
         this.connection,
-        sealSession,
+        botRow.encryptedPrivateKey,
+        config.MASTER_ENCRYPTION_KEY,
         marketData,
         botConfig,
         emergencyStop,
         circuitBreaker
       );
 
-      log.warn(
+      log.info(
         {
           botId,
-          walletPda: sealSession.getWalletPda().toBase58().slice(0, 8) + "…",
-          sessionPubkey: sealSession.sessionPubkey.toBase58().slice(0, 8) + "…",
+          walletAddress: botRow.walletAddress?.slice(0, 8) + "…",
         },
-        "Sage live executor created — delegated wallet execution"
+        "Live executor created — server-side keypair"
       );
     } else {
       // SIMULATION MODE — virtual balance, real market data
@@ -452,7 +304,6 @@ export class BotOrchestrator {
       mlPredictor,
       emergencyStop,
       circuitBreaker,
-      walletManager,
       startedAt: Date.now(),
     };
 
@@ -506,6 +357,12 @@ export class BotOrchestrator {
       }
 
       await running.engine.stop();
+
+      // Zeroize decrypted keypair material (live mode only)
+      if ('destroy' in running.executor && typeof running.executor.destroy === 'function') {
+        running.executor.destroy();
+      }
+
       this.runningBots.delete(botId);
 
       log.info({ botId }, "Bot stopped");
@@ -527,6 +384,11 @@ export class BotOrchestrator {
     // Trigger via safety system — this fires the onTrigger callback
     // which handles auto-close + DB update + event emission
     running.emergencyStop.manualTrigger("Manual emergency stop via API");
+
+    // Zeroize keypair material
+    if ('destroy' in running.executor && typeof running.executor.destroy === 'function') {
+      running.executor.destroy();
+    }
 
     // Also clean up orchestrator state
     this.runningBots.delete(botId);
@@ -1174,17 +1036,3 @@ export class BotOrchestrator {
 }
 
 export const orchestrator = BotOrchestrator.getInstance();
-
-// ── Helpers for CreateSession instruction encoding ──
-
-function encodeU64(value: bigint): Buffer {
-  const buf = Buffer.alloc(8);
-  buf.writeBigUInt64LE(value);
-  return buf;
-}
-
-function encodeI64(value: bigint): Buffer {
-  const buf = Buffer.alloc(8);
-  buf.writeBigInt64LE(value);
-  return buf;
-}

@@ -21,19 +21,10 @@ const envSchema = z.object({
     .transform((v) => (v === "mainnet" ? "mainnet-beta" : v))
     .pipe(z.enum(["mainnet-beta", "devnet", "localnet"])),
   SOLANA_RPC_URL: z.string().url().default("https://api.devnet.solana.com"),
-  SEAL_PROGRAM_ID: z.string().min(32).max(50).default("EV3TKRVz7pTHpAqBTjP8jmwuvoRBRCpjmVSPHhcMnXqb"),
-  SEAL_ALLOWED_PROGRAMS: z
+  MASTER_ENCRYPTION_KEY: z
     .string()
-    .optional()
-    .describe("Comma-separated extra program IDs allowed for Seal agents across all clusters"),
-  SEAL_ALLOWED_PROGRAMS_MAINNET: z
-    .string()
-    .optional()
-    .describe("Comma-separated extra program IDs allowed for Seal agents on mainnet-beta"),
-  SEAL_ALLOWED_PROGRAMS_DEVNET: z
-    .string()
-    .optional()
-    .describe("Comma-separated extra program IDs allowed for Seal agents on devnet/localnet"),
+    .regex(/^[0-9a-fA-F]{64}$/, "MASTER_ENCRYPTION_KEY must be 64 hex chars (32 bytes)")
+    .describe("AES-256-GCM key for encrypting bot keypairs at rest"),
   JWT_SECRET: z
     .string()
     .min(32, "JWT_SECRET must be at least 32 characters"),

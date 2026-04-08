@@ -6,7 +6,7 @@
  */
 
 import { Hono } from "hono";
-import { getConnection, SEAL_PROGRAM_ID } from "../services/solana.js";
+import { getConnection } from "../services/solana.js";
 import config from "../config.js";
 import db from "../db/index.js";
 import { users } from "../db/schema.js";
@@ -21,11 +21,10 @@ health.get("/", async (c) => {
   const checks: Record<string, unknown> = {
     status: "ok",
     timestamp: new Date().toISOString(),
-    version: "0.2.0",
+    version: "0.3.0",
     uptime: Math.floor((Date.now() - startTime) / 1000),
     environment: config.NODE_ENV,
     network: config.SOLANA_NETWORK,
-    programId: SEAL_PROGRAM_ID.toBase58(),
   };
 
   // Solana RPC check

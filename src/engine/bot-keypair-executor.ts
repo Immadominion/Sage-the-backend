@@ -1,32 +1,38 @@
 /**
- * SealExecutor — Live trade execution through Seal smart wallets.
+ * BotKeypairExecutor — Executes REAL transactions on Meteora DLMM
+ * using an encrypted bot keypair (AES-256-GCM at rest).
  *
- * Same lifecycle as LiveExecutor (open/close/update positions on DLMM)
- * but all instructions are wrapped in executeViaSession so the
- * Seal program validates spending limits and CPI-invokes with the
- * wallet PDA as signer.
+ * This replaces SealExecutor. Each bot gets its own Solana keypair
+ * with the private key encrypted in the database. No on-chain wallet
+ * program, no CPI wrapping, no session expiry — just direct signing.
  *
- * Key differences from LiveExecutor:
- *  - "user" = wallet PDA (not a direct keypair)
- *  - Every DLMM instruction → wrapInstruction() → executeViaSession
- *  - Session keypair signs the outer TX (no wallet private key needed)
- *  - Positions are owned by the wallet PDA (CPI invoke_signed)
+ * Safety layers:
+ *  1. Encrypted keypair — decrypted only in-memory during trading
+ *  2. EmergencyStop — kill switch on loss limits (injected)
+ *  3. CircuitBreaker — rate / exposure limits (injected)
+ *  4. TransactionSender — retry with exponential backoff + priority fees
+ *  5. Withdrawal whitelist — funds only return to owner's verified wallet
  *
- * ⚠️ CRITICAL: This handles REAL MONEY through delegated authority.
+ * Position lifecycle:
+ *  open  → DLMM.initializePositionAndAddLiquidityByStrategy()
+ *  update → DLMM.getPositionsByUserAndLbPair() (price + fees refresh)
+ *  close → DLMM.removeLiquidity({ shouldClaimAndClose: true })
+ *          → Jupiter V6 swap leftover tokens → SOL
+ *
+ * ⚠️ CRITICAL: This handles REAL MONEY.
  */
 
 import {
-    ComputeBudgetProgram,
     Connection,
+    PublicKey,
     Keypair,
+    VersionedTransaction,
     LAMPORTS_PER_SOL,
-    SystemProgram,
-    Transaction,
-    TransactionInstruction,
 } from "@solana/web3.js";
 import {
-    ASSOCIATED_TOKEN_PROGRAM_ID,
-    TOKEN_PROGRAM_ID,
+    getAssociatedTokenAddress,
+    getAccount,
+    TokenAccountNotFoundError,
 } from "@solana/spl-token";
 import BN from "bn.js";
 import { v4 as uuidv4 } from "uuid";
@@ -40,31 +46,21 @@ import type {
     BotConfig,
     MeteoraPairData,
 } from "./types.js";
-import { SealSession } from "./seal-session.js";
+import { SOL_MINT } from "./types.js";
+import { decryptKeypair } from "./crypto-utils.js";
 import { TransactionSender } from "./transaction-sender.js";
 import { MarketDataProvider } from "./market-data.js";
 import { EmergencyStop } from "./emergency-stop.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
 import { logger } from "../middleware/logger.js";
 
-const log = logger.child({ module: "seal-executor" });
-
-// Meteora DLMM instruction discriminators from the checked-in IDL.
-const DLMM_INITIALIZE_POSITION_DISC = Buffer.from([
-    219, 192, 234, 71, 190, 191, 102, 80,
-]);
-const DLMM_INITIALIZE_BIN_ARRAY_DISC = Buffer.from([
-    35, 86, 19, 185, 78, 212, 75, 211,
-]);
-const DLMM_ADD_LIQUIDITY_BY_STRATEGY2_DISC = Buffer.from([
-    3, 221, 149, 218, 111, 141, 118, 213,
-]);
+const log = logger.child({ module: "bot-keypair-executor" });
 
 // ═══════════════════════════════════════════════════════════════
 // Config
 // ═══════════════════════════════════════════════════════════════
 
-export interface SealExecutorConfig {
+export interface BotKeypairExecutorConfig {
     priorityFeeMicroLamports: number;
     confirmationTimeoutMs: number;
     maxRetries: number;
@@ -72,7 +68,7 @@ export interface SealExecutorConfig {
     jupiterDustThresholdSOL: number;
 }
 
-const DEFAULT_CONFIG: SealExecutorConfig = {
+const DEFAULT_CONFIG: BotKeypairExecutorConfig = {
     priorityFeeMicroLamports: 10_000,
     confirmationTimeoutMs: 60_000,
     maxRetries: 3,
@@ -81,157 +77,32 @@ const DEFAULT_CONFIG: SealExecutorConfig = {
 };
 
 // ═══════════════════════════════════════════════════════════════
-// SealExecutor
+// BotKeypairExecutor
 // ═══════════════════════════════════════════════════════════════
 
-export class SealExecutor implements ITradingExecutor {
+export class BotKeypairExecutor implements ITradingExecutor {
     private connection: Connection;
-    private session: SealSession;
+    private keypair: Keypair;
     private txSender: TransactionSender;
     private marketData: MarketDataProvider;
     private config: BotConfig;
-    private execConfig: SealExecutorConfig;
-
+    private execConfig: BotKeypairExecutorConfig;
     private emergencyStop: EmergencyStop;
     private circuitBreaker: CircuitBreaker;
-
     private positions: Map<string, TrackedPosition> = new Map();
-
-    private matchesDiscriminator(data: Buffer, disc: Buffer): boolean {
-        return data.length >= disc.length && data.subarray(0, disc.length).equals(disc);
-    }
-
-    /**
-     * Meteora's SDK assumes a normal system wallet is both payer and owner.
-     * Seal wallets are PDAs with data, so they cannot be the source account
-     * for raw SystemProgram transfers or rent-paying account creation.
-     *
-     * We rewrite only the payer-style accounts to the session signer while
-     * keeping the wallet PDA as the position/token owner for the CPI.
-     */
-    private rewriteDelegatedIx(innerIx: TransactionInstruction): TransactionInstruction {
-        const walletPda = this.session.getWalletPda();
-        const sessionSigner = this.session.getSessionKeypair().publicKey;
-        const keys = innerIx.keys.map((key) => ({ ...key }));
-
-        if (
-            innerIx.programId.equals(ASSOCIATED_TOKEN_PROGRAM_ID) &&
-            keys.length >= 1 &&
-            keys[0].pubkey.equals(walletPda)
-        ) {
-            keys[0] = {
-                ...keys[0],
-                pubkey: sessionSigner,
-                isSigner: true,
-                isWritable: true,
-            };
-        } else if (
-            innerIx.programId.equals(SystemProgram.programId) &&
-            keys.length >= 1 &&
-            keys[0].pubkey.equals(walletPda)
-        ) {
-            keys[0] = {
-                ...keys[0],
-                pubkey: sessionSigner,
-                isSigner: true,
-                isWritable: true,
-            };
-        } else if (
-            this.matchesDiscriminator(innerIx.data, DLMM_INITIALIZE_POSITION_DISC) &&
-            keys.length >= 4 &&
-            keys[0].pubkey.equals(walletPda)
-        ) {
-            // Accounts: payer, position, lbPair, owner, ...
-            keys[0] = {
-                ...keys[0],
-                pubkey: sessionSigner,
-                isSigner: true,
-                isWritable: true,
-            };
-        } else if (
-            this.matchesDiscriminator(innerIx.data, DLMM_INITIALIZE_BIN_ARRAY_DISC) &&
-            keys.length >= 3 &&
-            keys[2].pubkey.equals(walletPda)
-        ) {
-            // Accounts: lbPair, binArray, funder, ...
-            keys[2] = {
-                ...keys[2],
-                pubkey: sessionSigner,
-                isSigner: true,
-                isWritable: true,
-            };
-        } else if (
-            innerIx.programId.equals(TOKEN_PROGRAM_ID) &&
-            innerIx.data.length >= 1 &&
-            innerIx.data[0] === 9 && // CloseAccount discriminator
-            keys.length >= 2 &&
-            keys[1].pubkey.equals(walletPda)
-        ) {
-            // Token::CloseAccount accounts: [account, destination, authority]
-            // Redirect destination from walletPda → sessionSigner so SOL
-            // from closed wSOL ATAs returns to the operational account.
-            keys[1] = {
-                ...keys[1],
-                pubkey: sessionSigner,
-                isSigner: false,
-                isWritable: true,
-            };
-        }
-
-        return new TransactionInstruction({
-            programId: innerIx.programId,
-            keys,
-            data: innerIx.data,
-        });
-    }
-
-    private rewriteDelegatedTx(tx: Transaction): Transaction {
-        const rewritten = new Transaction();
-        rewritten.feePayer = this.session.getSessionKeypair().publicKey;
-        rewritten.recentBlockhash = tx.recentBlockhash;
-        rewritten.lastValidBlockHeight = tx.lastValidBlockHeight;
-
-        for (const ix of tx.instructions) {
-            rewritten.add(this.rewriteDelegatedIx(ix));
-        }
-
-        return rewritten;
-    }
-
-    private wrapCreatePositionTx(tx: Transaction, amountLamports: bigint): Transaction {
-        const wrapped = new Transaction();
-        wrapped.feePayer = this.session.getSessionKeypair().publicKey;
-
-        for (const ix of tx.instructions) {
-            if (ix.programId.equals(ComputeBudgetProgram.programId)) {
-                wrapped.add(ix);
-                continue;
-            }
-
-            const trackedAmount = this.matchesDiscriminator(
-                ix.data,
-                DLMM_ADD_LIQUIDITY_BY_STRATEGY2_DISC
-            )
-                ? amountLamports
-                : 0n;
-
-            wrapped.add(this.session.wrapInstruction(ix, trackedAmount));
-        }
-
-        return wrapped;
-    }
 
     constructor(
         connection: Connection,
-        session: SealSession,
+        encryptedPrivateKey: string,
+        masterKey: string,
         marketData: MarketDataProvider,
         config: BotConfig,
         emergencyStop: EmergencyStop,
         circuitBreaker: CircuitBreaker,
-        execConfig?: Partial<SealExecutorConfig>
+        execConfig?: Partial<BotKeypairExecutorConfig>
     ) {
         this.connection = connection;
-        this.session = session;
+        this.keypair = decryptKeypair(encryptedPrivateKey, masterKey);
         this.marketData = marketData;
         this.config = config;
         this.emergencyStop = emergencyStop;
@@ -246,15 +117,21 @@ export class SealExecutor implements ITradingExecutor {
 
         log.warn(
             {
-                walletPda: session.getWalletPda().toBase58().slice(0, 8) + "…",
-                sessionPubkey: session.sessionPubkey.toBase58().slice(0, 8) + "…",
+                wallet: this.keypair.publicKey.toBase58().slice(0, 8) + "…",
             },
-            "SAGE LIVE EXECUTOR INITIALIZED — Delegated wallet execution"
+            "BOT KEYPAIR EXECUTOR INITIALIZED — REAL MONEY MODE"
         );
     }
 
+    /**
+     * Zeroize the in-memory keypair. Call on bot stop.
+     */
+    destroy(): void {
+        this.keypair.secretKey.fill(0);
+    }
+
     // ═══════════════════════════════════════════════════════════════
-    // Open Position (via Seal session)
+    // Open Position
     // ═══════════════════════════════════════════════════════════════
 
     async openPosition(
@@ -263,7 +140,6 @@ export class SealExecutor implements ITradingExecutor {
         amountX: BN,
         amountY: BN
     ): Promise<OpenPositionResult> {
-        // ── Safety checks ──
         const eCheck = this.emergencyStop.canTrade();
         if (!eCheck.allowed) {
             log.warn({ reason: eCheck.reason }, "Emergency stop active");
@@ -271,24 +147,24 @@ export class SealExecutor implements ITradingExecutor {
         }
 
         const totalAmount = amountX.add(amountY);
-        const cbCheck = this.circuitBreaker.canOpenPosition(poolAddress, totalAmount);
+        const cbCheck = this.circuitBreaker.canOpenPosition(
+            poolAddress,
+            totalAmount
+        );
         if (!cbCheck.allowed) {
             log.warn({ reason: cbCheck.reason }, "Circuit breaker triggered");
             return { success: false, error: `Circuit breaker: ${cbCheck.reason}` };
         }
 
         try {
-            const walletPda = this.session.getWalletPda();
             log.info(
                 {
                     pool: poolAddress.slice(0, 8) + "…",
                     amountSOL: totalAmount.toNumber() / LAMPORTS_PER_SOL,
-                    via: "delegated-wallet",
                 },
-                "Opening live position…"
+                "Opening position…"
             );
 
-            // Get pool data & DLMM instance
             const poolData = await this.marketData.getPoolData(poolAddress);
             if (!poolData) {
                 return { success: false, error: "Pool not found" };
@@ -299,68 +175,17 @@ export class SealExecutor implements ITradingExecutor {
             const activeBin = await dlmm.getActiveBin();
             const positionKeypair = Keypair.generate();
 
-            // ── Pre-fund session signer from wallet PDA ──
-            // The session signer needs SOL for:
-            //   - position account rent (~0.057 SOL)
-            //   - bin array creation rent
-            //   - ATA creation rent
-            //   - SOL wrapping transfers (the actual liquidity deposit)
-            //   - transaction fees
-            // We use the Seal program's TransferLamports instruction to
-            // move funds from the wallet PDA → session signer before the trade.
-            const POSITION_RENT_ESTIMATE = 60_000_000; // ~0.06 SOL
-            const TX_FEE_BUFFER = 10_000_000;          // ~0.01 SOL
-            const requestedTotal = amountX.add(amountY).toNumber();
-            const sessionNeeded = requestedTotal + POSITION_RENT_ESTIMATE + TX_FEE_BUFFER;
-
-            const fundResult = await this.session.fundSessionFromWallet(sessionNeeded);
-            if (!fundResult.funded) {
-                const walletBalance = await this.connection.getBalance(walletPda);
-                const has = (walletBalance / LAMPORTS_PER_SOL).toFixed(4);
-                const needs = (sessionNeeded / LAMPORTS_PER_SOL).toFixed(2);
-                const depositNeeded = (Math.ceil((sessionNeeded - walletBalance) / 10_000_000) / 100).toFixed(2);
-
-                // Only report insufficient_balance when wallet PDA truly can't cover it.
-                // Fund TX can fail for transient reasons (RPC timeout, agent broke for fees).
-                // Reporting insufficient_balance triggers emergency stop — don't false-positive.
-                const walletActuallyShort = walletBalance < sessionNeeded;
-
-                log.warn(
-                    {
-                        walletBalance: has,
-                        needed: needs,
-                        depositNeeded,
-                        positionSizeSOL: (requestedTotal / LAMPORTS_PER_SOL).toFixed(4),
-                        fundError: fundResult.error,
-                        walletActuallyShort,
-                    },
-                    walletActuallyShort
-                      ? "Cannot pre-fund session — insufficient wallet PDA balance"
-                      : "Cannot pre-fund session — transfer TX failed (transient)"
-                );
-
-                if (walletActuallyShort) {
-                    return {
-                        success: false,
-                        error: `insufficient_balance:${has}:${needs}:${depositNeeded}`,
-                    };
-                }
-                // Transient failure — return a non-fatal error so the engine retries next scan
-                return {
-                    success: false,
-                    error: `fund_transfer_failed:${fundResult.error ?? "unknown"}`,
-                };
-            }
-
-            // Re-check actual session balance after funding
-            const sessionSignerBalance = await this.connection.getBalance(
-                this.session.getSessionKeypair().publicKey
+            // Rent-aware position sizing
+            const RENT_BUFFER = 25_000_000; // 0.025 SOL
+            const currentBalance = await this.connection.getBalance(
+                this.keypair.publicKey
             );
+            const maxDeposit = Math.max(0, currentBalance - RENT_BUFFER);
 
-            // Adjust position size if session signer still can't cover full request
-            const maxDeposit = sessionSignerBalance - POSITION_RENT_ESTIMATE - TX_FEE_BUFFER;
             let adjX = amountX;
             let adjY = amountY;
+            const requestedTotal = amountX.add(amountY).toNumber();
+
             if (requestedTotal > maxDeposit) {
                 const ratio = maxDeposit / requestedTotal;
                 adjX = new BN(Math.floor(amountX.toNumber() * ratio));
@@ -370,27 +195,24 @@ export class SealExecutor implements ITradingExecutor {
                         requested: (requestedTotal / LAMPORTS_PER_SOL).toFixed(4),
                         adjusted: (maxDeposit / LAMPORTS_PER_SOL).toFixed(4),
                     },
-                    "Adjusted position size for session signer balance"
+                    "Adjusted position size for rent costs"
                 );
             }
 
             const adjTotal = adjX.add(adjY).toNumber();
-            const minLamports = (this.config.minPositionSOL ?? 0.05) * LAMPORTS_PER_SOL;
+            const minLamports =
+                (this.config.minPositionSOL ?? 0.05) * LAMPORTS_PER_SOL;
             if (adjTotal < minLamports) {
-                const adjSOL = (adjTotal / LAMPORTS_PER_SOL).toFixed(6);
-                const minSOL = (minLamports / LAMPORTS_PER_SOL).toFixed(2);
-                const shortfall = ((minLamports - adjTotal + POSITION_RENT_ESTIMATE + TX_FEE_BUFFER) / LAMPORTS_PER_SOL);
-                const depositNeeded = (Math.ceil(shortfall * 100) / 100).toFixed(2);
                 return {
                     success: false,
-                    error: `insufficient_balance:${adjSOL}:${minSOL}:${depositNeeded}`,
+                    error: `Insufficient balance after rent: ${(adjTotal / LAMPORTS_PER_SOL).toFixed(4)} SOL`,
                 };
             }
 
-            // ── Build DLMM instruction with walletPda as "user" ──
+            // Build & send create-position tx
             const createTx = await dlmm.initializePositionAndAddLiquidityByStrategy({
                 positionPubKey: positionKeypair.publicKey,
-                user: walletPda, // Seal wallet PDA is the "user"
+                user: this.keypair.publicKey,
                 totalXAmount: adjX,
                 totalYAmount: adjY,
                 strategy: {
@@ -399,17 +221,10 @@ export class SealExecutor implements ITradingExecutor {
                     strategyType: strategy.strategyType,
                 },
             });
-            const delegatedCreateTx = this.rewriteDelegatedTx(createTx);
 
-            // ── Wrap in executeViaSession ──
-            const amountLamports = BigInt(adjTotal);
-            await this.session.assertFeePayerFunded();
-            const wrappedTx = this.wrapCreatePositionTx(delegatedCreateTx, amountLamports);
-            const txWithFees = this.txSender.addPriorityFee(wrappedTx);
-
-            // Sign with session keypair + position keypair
+            const txWithFees = this.txSender.addPriorityFee(createTx);
             const result = await this.txSender.sendTransaction(txWithFees, [
-                this.session.getSessionKeypair(),
+                this.keypair,
                 positionKeypair,
             ]);
 
@@ -418,7 +233,7 @@ export class SealExecutor implements ITradingExecutor {
                 return { success: false, error: result.error };
             }
 
-            // ── Track entry tx cost ──
+            // Track entry tx cost
             let entryTxCost = 0;
             if (result.signature) {
                 try {
@@ -434,7 +249,6 @@ export class SealExecutor implements ITradingExecutor {
 
             this.circuitBreaker.recordPositionOpened(poolAddress, adjX.add(adjY));
 
-            // ── Create tracked position ──
             const positionId = uuidv4();
             const position: TrackedPosition = {
                 id: positionId,
@@ -475,7 +289,7 @@ export class SealExecutor implements ITradingExecutor {
                     txSignature: result.signature,
                     txCost: entryTxCost,
                 },
-                "Position opened (live)"
+                "Position opened"
             );
 
             return {
@@ -490,7 +304,7 @@ export class SealExecutor implements ITradingExecutor {
                     err: error instanceof Error ? error.message : String(error),
                     poolAddress,
                 },
-                "Failed to open live position"
+                "Failed to open position"
             );
             this.emergencyStop.recordTxFailure();
             return {
@@ -501,7 +315,7 @@ export class SealExecutor implements ITradingExecutor {
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // Close Position (via Seal session)
+    // Close Position
     // ═══════════════════════════════════════════════════════════════
 
     async closePosition(
@@ -514,14 +328,13 @@ export class SealExecutor implements ITradingExecutor {
                 return { success: false, error: `Position ${positionId} not found` };
             }
 
-            log.info({ positionId, reason }, "Closing live position…");
+            log.info({ positionId, reason }, "Closing position…");
 
             const dlmm = await this.marketData.getDLMM(position.poolAddress);
-            const walletPda = this.session.getWalletPda();
 
-            // ── Find on-chain position (owned by wallet PDA) ──
+            // Find on-chain position
             const { userPositions } = await dlmm.getPositionsByUserAndLbPair(
-                walletPda
+                this.keypair.publicKey
             );
 
             const onChain = userPositions.find((p: any) =>
@@ -529,7 +342,10 @@ export class SealExecutor implements ITradingExecutor {
             );
 
             if (!onChain) {
-                log.warn({ positionId }, "Position not found on-chain — marking closed");
+                log.warn(
+                    { positionId },
+                    "Position not found on-chain — marking closed"
+                );
                 position.status = "CLOSED";
                 position.exitReason = "NOT_FOUND_ON_CHAIN";
                 position.exitTimestamp = Date.now();
@@ -550,7 +366,7 @@ export class SealExecutor implements ITradingExecutor {
                 return { success: true };
             }
 
-            // ── Capture real fees before removal ──
+            // Capture real fees before removal
             const feesX: BN = onChain.positionData.feeX || new BN(0);
             const feesY: BN = onChain.positionData.feeY || new BN(0);
             const totalFeesX = position.feesEarnedX
@@ -561,33 +377,32 @@ export class SealExecutor implements ITradingExecutor {
                 : feesY;
 
             log.info(
-                { positionId, feesX: totalFeesX.toString(), feesY: totalFeesY.toString() },
+                {
+                    positionId,
+                    feesX: totalFeesX.toString(),
+                    feesY: totalFeesY.toString(),
+                },
                 "Fees earned snapshot"
             );
 
-            // ── Remove liquidity (walletPda is the "user") ──
+            // Remove liquidity
             const removeTxs = await dlmm.removeLiquidity({
                 position: onChain.publicKey,
-                user: walletPda,
+                user: this.keypair.publicKey,
                 fromBinId: binIds[0],
                 toBinId: binIds[binIds.length - 1],
-                bps: new BN(100 * 100), // 100%
+                bps: new BN(100 * 100),
                 shouldClaimAndClose: true,
             });
 
             let lastSig = "";
             const txArray = Array.isArray(removeTxs) ? removeTxs : [removeTxs];
             let totalExitTxCost = 0;
-            const sessionKeypair = this.session.getSessionKeypair();
 
             for (const tx of txArray) {
-                // Wrap in executeViaSession (amount = 0 for withdrawals)
-                await this.session.assertFeePayerFunded();
-                const delegatedTx = this.rewriteDelegatedTx(tx);
-                const wrappedTx = this.session.wrapTransaction(delegatedTx, 0n);
-                const txWithFees = this.txSender.addPriorityFee(wrappedTx);
+                const txWithFees = this.txSender.addPriorityFee(tx);
                 const result = await this.txSender.sendTransaction(txWithFees, [
-                    sessionKeypair,
+                    this.keypair,
                 ]);
 
                 if (!result.success) {
@@ -610,7 +425,7 @@ export class SealExecutor implements ITradingExecutor {
                 }
             }
 
-            // ── Calculate real P&L ──
+            // Calculate real P&L
             const activeBin = await dlmm.getActiveBin();
             const exitPrice = parseFloat(activeBin.pricePerToken);
             const entryPrice = parseFloat(position.entryPricePerToken);
@@ -632,11 +447,12 @@ export class SealExecutor implements ITradingExecutor {
             const pnlSOL = pricePnl.toNumber() / LAMPORTS_PER_SOL;
             const netPnlSOL = pnlSOL + totalFeesSOL - txCostSOL;
 
-            // ── Safety records ──
-            this.circuitBreaker.recordPositionClosed(position.poolAddress, entryValue);
+            this.circuitBreaker.recordPositionClosed(
+                position.poolAddress,
+                entryValue
+            );
             this.emergencyStop.recordTradeResult(netPnlSOL);
 
-            // ── Update position record ──
             position.status = "CLOSED";
             position.exitPricePerToken = activeBin.pricePerToken;
             position.exitTimestamp = Date.now();
@@ -665,10 +481,24 @@ export class SealExecutor implements ITradingExecutor {
                 `Position closed (net ${emoji}${netPnlSOL.toFixed(6)} SOL)`
             );
 
-            // Note: Jupiter swap for leftover tokens is NOT done via Seal
-            // because Jupiter generates VersionedTransactions that cannot be
-            // easily wrapped. The leftover tokens stay in the wallet PDA and
-            // can be swapped later by the owner directly.
+            // Auto-swap leftover tokens → SOL (non-fatal)
+            const nonSolMint =
+                position.tokenYMint === SOL_MINT
+                    ? position.tokenXMint
+                    : position.tokenYMint;
+
+            if (nonSolMint && nonSolMint !== SOL_MINT) {
+                const swapResult = await this.swapLeftoverTokensToSOL(
+                    nonSolMint,
+                    position.poolName
+                );
+                if (swapResult.success && (swapResult.solReceived ?? 0) > 0) {
+                    log.info(
+                        { solRecovered: swapResult.solReceived?.toFixed(6) },
+                        "Capital recovered from token swap"
+                    );
+                }
+            }
 
             return {
                 success: true,
@@ -683,7 +513,7 @@ export class SealExecutor implements ITradingExecutor {
                     err: error instanceof Error ? error.message : String(error),
                     positionId,
                 },
-                "Failed to close live position"
+                "Failed to close position"
             );
             this.emergencyStop.recordTxFailure();
             return {
@@ -694,7 +524,7 @@ export class SealExecutor implements ITradingExecutor {
     }
 
     // ═══════════════════════════════════════════════════════════════
-    // Update position data (read-only — no wrapping needed)
+    // Update position data (from chain)
     // ═══════════════════════════════════════════════════════════════
 
     async updatePositionData(
@@ -705,10 +535,9 @@ export class SealExecutor implements ITradingExecutor {
 
         try {
             const dlmm = await this.marketData.getDLMM(position.poolAddress);
-            const walletPda = this.session.getWalletPda();
 
             const { userPositions, activeBin } =
-                await dlmm.getPositionsByUserAndLbPair(walletPda);
+                await dlmm.getPositionsByUserAndLbPair(this.keypair.publicKey);
 
             const onChain = userPositions.find((p: any) =>
                 p.publicKey.equals(position.positionPubkey)
@@ -754,17 +583,12 @@ export class SealExecutor implements ITradingExecutor {
     }
 
     async getBalance(): Promise<BN> {
-        // Sum wallet PDA + session signer balances.
-        // New deposits go to the wallet PDA (setup-live and prepare-deposit
-        // both target the PDA). The session signer fallback covers legacy
-        // deposits that went directly to the signer before the fix.
-        const [walletBalance, sessionBalance] = await Promise.all([
-            this.connection.getBalance(this.session.getWalletPda()),
-            this.connection.getBalance(
-                this.session.getSessionKeypair().publicKey
-            ),
-        ]);
-        return new BN(walletBalance + sessionBalance);
+        const balance = await this.connection.getBalance(this.keypair.publicKey);
+        return new BN(balance);
+    }
+
+    getPublicKey(): PublicKey {
+        return this.keypair.publicKey;
     }
 
     getPerformanceSummary(): {
@@ -800,6 +624,178 @@ export class SealExecutor implements ITradingExecutor {
             winRate: total > 0 ? wins / total : 0,
             totalPositions: closed.length,
         };
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // Jupiter V6 Swap — leftover tokens → SOL
+    // ═══════════════════════════════════════════════════════════════
+
+    private async swapLeftoverTokensToSOL(
+        tokenMint: string,
+        poolName: string
+    ): Promise<{
+        success: boolean;
+        amountSwapped?: number;
+        solReceived?: number;
+        error?: string;
+    }> {
+        try {
+            if (tokenMint === SOL_MINT) {
+                return { success: true, amountSwapped: 0 };
+            }
+
+            const mintPk = new PublicKey(tokenMint);
+            const ata = await getAssociatedTokenAddress(
+                mintPk,
+                this.keypair.publicKey
+            );
+
+            let tokenBalance: bigint;
+            try {
+                const account = await getAccount(this.connection, ata);
+                tokenBalance = account.amount;
+            } catch (e) {
+                if (e instanceof TokenAccountNotFoundError) {
+                    return { success: true, amountSwapped: 0 };
+                }
+                throw e;
+            }
+
+            if (tokenBalance <= 0n) {
+                return { success: true, amountSwapped: 0 };
+            }
+
+            log.info(
+                { pool: poolName, tokenBalance: tokenBalance.toString() },
+                "Swapping leftover tokens → SOL via Jupiter V6…"
+            );
+
+            // Get quote
+            const quoteUrl =
+                `https://quote-api.jup.ag/v6/quote` +
+                `?inputMint=${tokenMint}` +
+                `&outputMint=${SOL_MINT}` +
+                `&amount=${tokenBalance.toString()}` +
+                `&slippageBps=${this.execConfig.jupiterSlippageBps}`;
+
+            const quoteRes = await fetch(quoteUrl);
+            if (!quoteRes.ok) {
+                const body = await quoteRes.text();
+                log.warn({ status: quoteRes.status, body }, "Jupiter quote failed");
+                return {
+                    success: false,
+                    error: `Jupiter quote failed: HTTP ${quoteRes.status}`,
+                };
+            }
+
+            const quoteData = (await quoteRes.json()) as {
+                outAmount?: string;
+                priceImpactPct?: string;
+                [k: string]: unknown;
+            };
+
+            if (!quoteData?.outAmount) {
+                return { success: false, error: "No valid swap route found" };
+            }
+
+            const outSOL = parseInt(quoteData.outAmount) / LAMPORTS_PER_SOL;
+            log.info(
+                { outSOL: outSOL.toFixed(6), priceImpact: quoteData.priceImpactPct },
+                "Jupiter quote received"
+            );
+
+            if (outSOL < this.execConfig.jupiterDustThresholdSOL) {
+                return { success: true, amountSwapped: 0, solReceived: 0 };
+            }
+
+            // Get swap transaction
+            const swapRes = await fetch("https://quote-api.jup.ag/v6/swap", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    quoteResponse: quoteData,
+                    userPublicKey: this.keypair.publicKey.toBase58(),
+                    wrapAndUnwrapSol: true,
+                    dynamicComputeUnitLimit: true,
+                    prioritizationFeeLamports:
+                        this.execConfig.priorityFeeMicroLamports,
+                }),
+            });
+
+            if (!swapRes.ok) {
+                const body = await swapRes.text();
+                log.warn(
+                    { status: swapRes.status, body },
+                    "Jupiter swap tx request failed"
+                );
+                return {
+                    success: false,
+                    error: `Jupiter swap failed: HTTP ${swapRes.status}`,
+                };
+            }
+
+            const swapData = (await swapRes.json()) as {
+                swapTransaction?: string;
+                [k: string]: unknown;
+            };
+
+            if (!swapData.swapTransaction) {
+                return {
+                    success: false,
+                    error: "Jupiter returned no swap transaction",
+                };
+            }
+
+            // Deserialize, sign, send
+            const txBuf = Buffer.from(swapData.swapTransaction, "base64");
+            const vtx = VersionedTransaction.deserialize(txBuf);
+            vtx.sign([this.keypair]);
+
+            const rawTx = vtx.serialize();
+            const txSig = await this.connection.sendRawTransaction(rawTx, {
+                skipPreflight: false,
+                maxRetries: 3,
+            });
+
+            const confirmation = await this.connection.confirmTransaction(
+                txSig,
+                "confirmed"
+            );
+
+            if (confirmation.value.err) {
+                log.warn(
+                    { txSig, err: confirmation.value.err },
+                    "Swap transaction failed on-chain"
+                );
+                return {
+                    success: false,
+                    error: `Swap tx failed: ${JSON.stringify(confirmation.value.err)}`,
+                };
+            }
+
+            log.info(
+                { pool: poolName, solReceived: outSOL.toFixed(6), txSig },
+                "Leftover tokens swapped → SOL"
+            );
+
+            return {
+                success: true,
+                amountSwapped: Number(tokenBalance),
+                solReceived: outSOL,
+            };
+        } catch (error) {
+            log.warn(
+                {
+                    err: error instanceof Error ? error.message : String(error),
+                    pool: poolName,
+                },
+                "Failed to swap leftover tokens (non-fatal)"
+            );
+            return {
+                success: false,
+                error: error instanceof Error ? error.message : "Unknown error",
+            };
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════
@@ -847,4 +843,4 @@ export class SealExecutor implements ITradingExecutor {
     }
 }
 
-export default SealExecutor;
+export default BotKeypairExecutor;

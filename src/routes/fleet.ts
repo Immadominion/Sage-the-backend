@@ -99,7 +99,6 @@ fleet.get("/leaderboard", optionalAuth, async (c) => {
         .limit(limit);
 
     // Anonymize other users' wallets (show first 4 + last 4 chars)
-    // Never expose full personal wallet — use seal wallet or anonymize.
     const leaderboard = rows.map((row, index) => {
         const walletShort = `${row.ownerWallet.slice(0, 4)}...${row.ownerWallet.slice(-4)}`;
 

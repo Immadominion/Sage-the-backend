@@ -65,11 +65,6 @@ logger.info(
   {
     network: config.SOLANA_NETWORK,
     rpcUrl: config.SOLANA_RPC_URL,
-    sealProgramId: config.SEAL_PROGRAM_ID,
-    extraAllowedPrograms:
-      config.SOLANA_NETWORK === "mainnet-beta"
-        ? config.SEAL_ALLOWED_PROGRAMS_MAINNET ?? config.SEAL_ALLOWED_PROGRAMS ?? ""
-        : config.SEAL_ALLOWED_PROGRAMS_DEVNET ?? config.SEAL_ALLOWED_PROGRAMS ?? "",
   },
   "Backend startup configuration"
 );
@@ -159,7 +154,6 @@ const server = serve(
     logger.info(`  Port:      ${info.port}`);
     logger.info(`  Network:   ${config.SOLANA_NETWORK}`);
     logger.info(`  RPC:       ${config.SOLANA_RPC_URL}`);
-    logger.info(`  Program:   ${config.SEAL_PROGRAM_ID}`);
     logger.info(`  Database:  ${config.DATABASE_URL}`);
     logger.info("═".repeat(60));
     logger.info("Endpoints:");
@@ -168,9 +162,9 @@ const server = serve(
     logger.info("  POST /auth/verify");
     logger.info("  POST /auth/refresh");
     logger.info("  GET  /auth/me");
-    logger.info("  POST /wallet/prepare-create");
-    logger.info("  GET  /wallet/state");
-    logger.info("  GET  /wallet/balance");
+    logger.info("  GET  /wallet/balance/:botId");
+    logger.info("  GET  /wallet/address/:botId");
+    logger.info("  POST /wallet/withdraw/:botId");
     logger.info("  POST /bot/create");
     logger.info("  GET  /bot/list");
     logger.info("  GET  /bot/:botId");
