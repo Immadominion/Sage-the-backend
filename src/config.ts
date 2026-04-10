@@ -42,7 +42,7 @@ const envSchema = z.object({
   METEORA_API_URL: z
     .string()
     .url()
-    .default("https://dlmm-api.meteora.ag"),
+    .default("https://dlmm.datapi.meteora.ag"),
   WALLET_PATH: z
     .string()
     .optional()

@@ -34,7 +34,8 @@ bot.use("/*", requireAuth);
 // Schemas
 // ═══════════════════════════════════════════════════════════════
 
-const createBotSchema = z.object({
+/** Base shape — used for both create (with defaults) and update (partial). */
+const baseBotConfigSchema = z.object({
   name: z.string().min(1).max(64).optional(),
   mode: z.enum(["simulation", "live"]).default("simulation"),
   strategyMode: z.enum(["rule-based", "sage-ai", "both"]).default("rule-based"),
@@ -63,7 +64,47 @@ const createBotSchema = z.object({
   isPublic: z.boolean().default(false),
 });
 
-const updateBotConfigSchema = createBotSchema.partial().omit({ mode: true });
+/**
+ * Create schema — auto-clamps capital-coherence for simulation mode.
+ *
+ * Instead of rejecting invalid configs, we silently fix them:
+ *  1. Position size ≥ bankroll → clamp to 40% of bankroll
+ *  2. Daily loss limit > bankroll → clamp to bankroll
+ *  3. Max theoretical exposure > 2× bankroll → reduce maxConcurrentPositions
+ *
+ * This acts as a safety net after the AI prompt + clampParams
+ * have already tried to produce valid params.
+ *
+ * Live-mode passes through unchanged (bankroll depends on future deposits).
+ */
+const createBotSchema = baseBotConfigSchema.transform((data) => {
+  if (data.mode !== "simulation") return data;
+
+  const bankroll = data.simulationBalanceSOL;
+
+  // Position size must be < bankroll
+  if (data.positionSizeSOL >= bankroll) {
+    data.positionSizeSOL = Math.round(Math.min(bankroll * 0.4, 10.0) * 10) / 10;
+    // Ensure at least 0.1
+    data.positionSizeSOL = Math.max(0.1, data.positionSizeSOL);
+  }
+
+  // Daily loss ≤ bankroll
+  if (data.maxDailyLossSOL > bankroll) {
+    data.maxDailyLossSOL = bankroll;
+  }
+
+  // Exposure: positionSize × maxConcurrent ≤ 2× bankroll
+  const maxExposure = data.positionSizeSOL * data.maxConcurrentPositions;
+  if (maxExposure > bankroll * 2) {
+    const maxAllowed = Math.floor((bankroll * 2) / data.positionSizeSOL);
+    data.maxConcurrentPositions = Math.max(1, maxAllowed);
+  }
+
+  return data;
+});
+
+const updateBotConfigSchema = baseBotConfigSchema.partial().omit({ mode: true });
 
 /** Bot ID is an 8-char hex string from crypto.randomBytes(4). */
 const BOT_ID_REGEX = /^[0-9a-f]{8}$/;

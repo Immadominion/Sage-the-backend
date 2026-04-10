@@ -17,6 +17,59 @@ interface CacheEntry<T> {
   fetchPromise?: Promise<T>;
 }
 
+interface DlmmTimeWindowData {
+  "30m"?: number;
+  "1h"?: number;
+  "2h"?: number;
+  "4h"?: number;
+  "12h"?: number;
+  "24h"?: number;
+}
+
+interface DlmmPoolConfig {
+  bin_step?: number;
+  base_fee_pct?: number;
+  max_fee_pct?: number;
+  protocol_fee_pct?: number;
+}
+
+interface DlmmTokenMetrics {
+  address?: string;
+  is_verified?: boolean;
+}
+
+interface DlmmPoolRecord {
+  address: string;
+  name: string;
+  token_x?: DlmmTokenMetrics;
+  token_y?: DlmmTokenMetrics;
+  reserve_x?: string;
+  reserve_y?: string;
+  token_x_amount?: number;
+  token_y_amount?: number;
+  reward_mint_x?: string;
+  reward_mint_y?: string;
+  pool_config?: DlmmPoolConfig;
+  dynamic_fee_pct?: number;
+  tvl?: number;
+  current_price?: number;
+  apr?: number;
+  apy?: number;
+  farm_apr?: number;
+  farm_apy?: number;
+  volume?: DlmmTimeWindowData;
+  fees?: DlmmTimeWindowData;
+  cumulative_metrics?: {
+    volume?: number;
+    fees?: number;
+  };
+  is_blacklisted?: boolean;
+}
+
+interface DlmmPoolsResponse {
+  data: DlmmPoolRecord[];
+}
+
 class SharedAPICache {
   private static instance: SharedAPICache;
 
@@ -68,7 +121,13 @@ class SharedAPICache {
       try {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 15_000);
-        const response = await fetch(url, { signal: controller.signal });
+        const response = await fetch(url, {
+          signal: controller.signal,
+          headers: {
+            accept: "application/json",
+            "user-agent": "sage-backend/0.3",
+          },
+        });
         clearTimeout(timeout);
         return response;
       } catch (error) {
@@ -142,14 +201,15 @@ class SharedAPICache {
   }
 
   private async fetchAllPoolsInternal(): Promise<MeteoraPairData[]> {
-    const url = `${config.METEORA_API_URL}/pair/all`;
+    const url = `${config.METEORA_API_URL}/pools?page=1&page_size=1000&sort_by=volume_24h:desc&filter_by=is_blacklisted=false`;
     const response = await this.rateLimitedFetch(url);
 
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}: ${response.statusText}`);
     }
 
-    return response.json() as Promise<MeteoraPairData[]>;
+    const payload = (await response.json()) as DlmmPoolsResponse;
+    return (payload.data ?? []).map((pool) => this.normalizePool(pool));
   }
 
   // ── Single pool ──
@@ -166,7 +226,7 @@ class SharedAPICache {
     this.stats.cacheMisses++;
 
     try {
-      const url = `${config.METEORA_API_URL}/pair/${poolAddress}`;
+      const url = `${config.METEORA_API_URL}/pools/${poolAddress}`;
       const response = await this.rateLimitedFetch(url);
 
       if (!response.ok) {
@@ -174,7 +234,7 @@ class SharedAPICache {
         throw new Error(`HTTP ${response.status}`);
       }
 
-      const pool = (await response.json()) as MeteoraPairData;
+      const pool = this.normalizePool((await response.json()) as DlmmPoolRecord);
       this.poolCache.set(poolAddress, { data: pool, timestamp: Date.now() });
       return pool;
     } catch (error) {
@@ -184,6 +244,56 @@ class SharedAPICache {
       }
       throw error;
     }
+  }
+
+  private normalizePool(pool: DlmmPoolRecord): MeteoraPairData {
+    const volume = this.normalizeTimeWindow(pool.volume);
+    const fees = this.normalizeTimeWindow(pool.fees);
+    const poolConfig = pool.pool_config ?? {};
+
+    return {
+      address: pool.address,
+      name: pool.name,
+      mint_x: pool.token_x?.address ?? "",
+      mint_y: pool.token_y?.address ?? "",
+      reserve_x: pool.reserve_x ?? "",
+      reserve_y: pool.reserve_y ?? "",
+      reserve_x_amount: pool.token_x_amount ?? 0,
+      reserve_y_amount: pool.token_y_amount ?? 0,
+      bin_step: poolConfig.bin_step ?? 1,
+      base_fee_percentage: String(poolConfig.base_fee_pct ?? 0),
+      max_fee_percentage: String(poolConfig.max_fee_pct ?? 0),
+      protocol_fee_percentage: String(poolConfig.protocol_fee_pct ?? 0),
+      liquidity: String(pool.tvl ?? 0),
+      reward_mint_x: pool.reward_mint_x ?? "11111111111111111111111111111111",
+      reward_mint_y: pool.reward_mint_y ?? "11111111111111111111111111111111",
+      fees_24h: fees.hour_24,
+      today_fees: fees.hour_24,
+      trade_volume_24h: volume.hour_24,
+      cumulative_trade_volume: String(pool.cumulative_metrics?.volume ?? 0),
+      cumulative_fee_volume: String(pool.cumulative_metrics?.fees ?? 0),
+      current_price: pool.current_price ?? 0,
+      apr: pool.apr ?? 0,
+      apy: pool.apy ?? 0,
+      farm_apr: pool.farm_apr ?? 0,
+      farm_apy: pool.farm_apy ?? 0,
+      hide: false,
+      is_blacklisted: pool.is_blacklisted ?? false,
+      fees,
+      volume,
+      is_verified: Boolean(pool.token_x?.is_verified && pool.token_y?.is_verified),
+    };
+  }
+
+  private normalizeTimeWindow(data?: DlmmTimeWindowData) {
+    return {
+      min_30: data?.["30m"] ?? 0,
+      hour_1: data?.["1h"] ?? 0,
+      hour_2: data?.["2h"] ?? 0,
+      hour_4: data?.["4h"] ?? 0,
+      hour_12: data?.["12h"] ?? 0,
+      hour_24: data?.["24h"] ?? 0,
+    };
   }
 
   // ── Active bin cache ──

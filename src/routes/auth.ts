@@ -244,6 +244,7 @@ const setupProgressSchema = z.object({
     minLiquidity: z.number().optional(),
     maxLiquidity: z.number().optional(),
     positionSizeSOL: z.number().optional(),
+    simulationBalanceSOL: z.number().optional(),
     maxConcurrentPositions: z.number().optional(),
     defaultBinRange: z.number().optional(),
     profitTargetPercent: z.number().optional(),

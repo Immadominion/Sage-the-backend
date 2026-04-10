@@ -42,6 +42,7 @@ const chatSchema = z.object({
         minLiquidity: z.number().optional(),
         maxLiquidity: z.number().optional(),
         positionSizeSOL: z.number().optional(),
+        simulationBalanceSOL: z.number().optional(),
         maxConcurrentPositions: z.number().optional(),
         defaultBinRange: z.number().optional(),
         profitTargetPercent: z.number().optional(),
@@ -97,8 +98,9 @@ ai.post("/chat", zValidator("json", chatSchema), async (c) => {
         let portfolioContext = undefined;
         portfolioContext = await buildPortfolioContext(userId);
 
-        // Call Claude
-        const response = await aiService.chat(type, messageHistory, portfolioContext, currentParams);
+        // Call Claude (pass simulation bankroll for capital-aware clamping)
+        const simulationBalanceSOL = currentParams?.simulationBalanceSOL;
+        const response = await aiService.chat(type, messageHistory, portfolioContext, currentParams, simulationBalanceSOL);
 
         // Add assistant message (include strategyParams per-message
         // so individual messages carry their params through restore).

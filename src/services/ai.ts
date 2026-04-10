@@ -99,7 +99,14 @@ const SETUP_SYSTEM_PROMPT = `You are Sage — a concise, decisive AI that config
 - stopLossPercent: 1-20% (default 6%)
 - maxHoldTimeMinutes: 15-1440 (default 240)
 - maxDailyLossSOL: 0.5-25.0 (default 3.0)
-- cooldownMinutes: 0-240 (default 79)`;
+- cooldownMinutes: 0-240 (default 79)
+
+## Bankroll Constraint (CRITICAL)
+When the user is setting up a simulation bot, you will be told their simulation bankroll (e.g. "Simulation Bankroll: 20 SOL"). You MUST respect this:
+- positionSizeSOL × maxConcurrentPositions must NOT exceed 2× the bankroll.
+- positionSizeSOL must be LESS than the bankroll.
+- maxDailyLossSOL must NOT exceed the bankroll.
+If a user asks for aggressive settings, scale the reference profile to fit their bankroll. For example, with a 20 SOL bankroll: positionSizeSOL=2, maxConcurrentPositions=5 (exposure 10, within 40 limit). With 5 SOL: positionSizeSOL=0.5, maxConcurrentPositions=4 (exposure 2, within 10 limit). Always do the math before calling set_strategy_parameters.`;
 
 const PORTFOLIO_SYSTEM_PROMPT = `You are Sage — a concise AI assistant for Meteora DLMM LP portfolio analysis and the user's agentic assistant inside the Sage app.
 
@@ -268,7 +275,8 @@ class AiService {
         conversationType: "setup" | "portfolio" | "general",
         messages: ChatMessage[],
         portfolioContext?: PortfolioContext,
-        currentParams?: StrategyParams
+        currentParams?: StrategyParams,
+        simulationBalanceSOL?: number
     ): Promise<ChatResponse> {
         if (!this.anthropic) {
             throw new Error("Anthropic API key not configured");
@@ -288,6 +296,11 @@ class AiService {
         // Inject current strategy params so Claude can modify incrementally
         if (currentParams && Object.keys(currentParams).length > 0) {
             systemPrompt += `\n\n## User's Current Strategy Parameters\nThe user already has these parameters configured. When they ask for changes, update only the relevant values and keep the rest. Call set_strategy_parameters with the FULL updated set (current values + changes).\n${JSON.stringify(currentParams, null, 2)}`;
+        }
+
+        // Inject simulation bankroll so Claude respects capital constraints
+        if (simulationBalanceSOL && simulationBalanceSOL > 0) {
+            systemPrompt += `\n\n## Simulation Bankroll: ${simulationBalanceSOL} SOL\nThe user's simulation bankroll is ${simulationBalanceSOL} SOL. positionSizeSOL × maxConcurrentPositions MUST NOT exceed ${(simulationBalanceSOL * 2).toFixed(1)} SOL (2× bankroll). positionSizeSOL must be less than ${simulationBalanceSOL} SOL. maxDailyLossSOL must not exceed ${simulationBalanceSOL} SOL.`;
         }
 
         // Convert our messages to Anthropic format
@@ -346,7 +359,7 @@ class AiService {
                     if (block.name === "set_strategy_parameters") {
                         strategyParams = block.input as StrategyParams;
                         if (strategyParams) {
-                            strategyParams = this.clampParams(strategyParams);
+                            strategyParams = this.clampParams(strategyParams, simulationBalanceSOL);
                         }
                         toolResults.push({
                             id: block.id,
@@ -477,8 +490,9 @@ class AiService {
 
     /**
      * Clamp strategy parameters to valid ranges.
+     * When bankroll is provided, also enforce cross-field capital constraints.
      */
-    private clampParams(params: StrategyParams): StrategyParams {
+    private clampParams(params: StrategyParams, bankroll?: number): StrategyParams {
         const clamped: StrategyParams = {};
 
         if (params.entryScoreThreshold !== undefined)
@@ -505,6 +519,35 @@ class AiService {
             clamped.maxDailyLossSOL = Math.max(0.5, Math.min(25.0, params.maxDailyLossSOL));
         if (params.cooldownMinutes !== undefined)
             clamped.cooldownMinutes = Math.max(0, Math.min(240, Math.round(params.cooldownMinutes)));
+
+        // Cross-field bankroll constraints (mirrors configForBankroll logic)
+        if (bankroll && bankroll > 0) {
+            const posSize = clamped.positionSizeSOL ?? params.positionSizeSOL;
+            const maxConc = clamped.maxConcurrentPositions ?? params.maxConcurrentPositions;
+
+            // Position size must be < bankroll
+            if (posSize !== undefined && posSize >= bankroll) {
+                clamped.positionSizeSOL = Math.min(
+                    Math.round(bankroll * 0.4 * 10) / 10, // 40% of bankroll, 1 decimal
+                    10.0
+                );
+            }
+
+            // Exposure: positionSize × maxConcurrent ≤ 2× bankroll
+            const effectiveSize = clamped.positionSizeSOL ?? posSize;
+            if (effectiveSize !== undefined && maxConc !== undefined) {
+                const maxAllowed = Math.floor((bankroll * 2) / effectiveSize);
+                if (maxConc > maxAllowed) {
+                    clamped.maxConcurrentPositions = Math.max(1, maxAllowed);
+                }
+            }
+
+            // Daily loss ≤ bankroll
+            const dailyLoss = clamped.maxDailyLossSOL ?? params.maxDailyLossSOL;
+            if (dailyLoss !== undefined && dailyLoss > bankroll) {
+                clamped.maxDailyLossSOL = bankroll;
+            }
+        }
 
         return clamped;
     }

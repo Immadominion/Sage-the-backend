@@ -222,13 +222,17 @@ const shutdown = async (signal: string) => {
   forceTimer.unref(); // Don't prevent exit
 
   // Phase 1: Stop accepting new connections
-  server.close((err) => {
-    if (err) {
-      logger.error(err, "Error closing HTTP server");
-    } else {
-      logger.info("HTTP server closed — no longer accepting connections");
-    }
-  });
+  if (server.listening) {
+    server.close((err) => {
+      if (err) {
+        logger.error(err, "Error closing HTTP server");
+      } else {
+        logger.info("HTTP server closed — no longer accepting connections");
+      }
+    });
+  } else {
+    logger.info("HTTP server was not listening at shutdown");
+  }
 
   // Phase 2: Stop all running bots (waits for active trades to complete)
   try {

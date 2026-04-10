@@ -182,5 +182,60 @@ wallet.post(
   }
 );
 
+// ═══════════════════════════════════════════════════════════════
+// POST /wallet/prepare-deposit/:botId
+// Build a system transfer TX (user → bot wallet) for MWA signing.
+// The user (feePayer) signs client-side via their mobile wallet.
+// ═══════════════════════════════════════════════════════════════
+
+const prepareDepositSchema = z.object({
+  amountSOL: z.number().positive().max(10_000),
+  feePayer: z.string().min(32).max(50),
+});
+
+wallet.post(
+  "/prepare-deposit/:botId",
+  requireAuth,
+  zValidator("json", prepareDepositSchema),
+  async (c) => {
+    const userId = c.var.userId;
+    const botId = c.req.param("botId");
+    validateBotId(botId);
+
+    const bot = await getLiveBot(userId, botId);
+    const { amountSOL, feePayer } = c.req.valid("json");
+
+    const connection = getConnection();
+    const feePayerPubkey = new PublicKey(feePayer);
+    const botPubkey = new PublicKey(bot.walletAddress!);
+    const amountLamports = Math.floor(amountSOL * LAMPORTS_PER_SOL);
+
+    const { blockhash } = await connection.getLatestBlockhash("confirmed");
+
+    const tx = new Transaction({
+      feePayer: feePayerPubkey,
+      recentBlockhash: blockhash,
+    }).add(
+      SystemProgram.transfer({
+        fromPubkey: feePayerPubkey,
+        toPubkey: botPubkey,
+        lamports: amountLamports,
+      })
+    );
+
+    const serialized = tx
+      .serialize({ requireAllSignatures: false, verifySignatures: false })
+      .toString("base64");
+
+    return c.json({
+      transaction: serialized,
+      botId,
+      amountSOL,
+      depositAddress: bot.walletAddress,
+      network: config.SOLANA_NETWORK || "mainnet-beta",
+    });
+  }
+);
+
 
 export default wallet;

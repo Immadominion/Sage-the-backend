@@ -196,12 +196,53 @@ export interface TrackedPosition {
   trailingStopPercent?: number;
   highWaterMarkPercent?: number;
 
+  // ── Bin-level simulation data (Phase 1-4 of simulation roadmap) ──
+  lowerBinId?: number;
+  upperBinId?: number;
+  simulatedBins?: SimulatedBinPosition[];
+  isInRange?: boolean;
+  /** Percentage of position value that is token Y (0..1) */
+  compositionFactor?: number;
+  /** Accumulated fee estimate from real volume data (lamports) */
+  accumulatedFeeLamports?: number;
+  /** Timestamp of last fee accrual update */
+  lastFeeUpdateTimestamp?: number;
+
   // Exit data
   exitPricePerToken?: string;
   exitTimestamp?: number;
   exitTxSignature?: string;
   exitReason?: string;
   realizedPnlLamports?: BN;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Simulation Bin-Level Types
+// ═══════════════════════════════════════════════════════════════
+
+/** Per-bin state for a simulated DLMM position. */
+export interface SimulatedBinPosition {
+  binId: number;
+  /** Bin price in token Y per token X */
+  price: number;
+  /** Our token X amount in this bin (lamports) */
+  xAmount: number;
+  /** Our token Y amount in this bin (lamports) */
+  yAmount: number;
+  /** Our liquidity share in this bin */
+  liquidity: number;
+  /** Total liquidity in this bin from all LPs (estimated) */
+  totalBinLiquidity: number;
+}
+
+/** Fee-related data we can extract from pool API + on-chain info. */
+export interface PoolFeeInfo {
+  /** Base fee rate as a decimal (e.g., 0.002 = 0.2%) */
+  baseFeeRate: number;
+  /** Current total fee rate including dynamic component */
+  totalFeeRate: number;
+  /** Protocol's share of fees (0..1) */
+  protocolShare: number;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -366,4 +407,4 @@ export interface BotEvent {
 
 export const LAMPORTS_PER_SOL = 1_000_000_000;
 export const SOL_MINT = "So11111111111111111111111111111111111111112";
-export const METEORA_API_URL = "https://dlmm-api.meteora.ag";
+export const METEORA_API_URL = "https://dlmm.datapi.meteora.ag";

@@ -715,6 +715,7 @@ export class BotOrchestrator {
       // Update bot activity
       await db.update(bots)
         .set({
+          lastError: null,
           lastActivityAt: new Date(),
           updatedAt: new Date(),
         })
@@ -889,6 +890,7 @@ export class BotOrchestrator {
     // Update activity timestamp
     await db.update(bots)
       .set({
+        lastError: null,
         lastActivityAt: new Date(),
         updatedAt: new Date(),
       })

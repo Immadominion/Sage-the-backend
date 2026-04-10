@@ -2,6 +2,12 @@
 
 REST API backend for the Sage LP Intelligence Platform — powering the Sage mobile app's autonomous Meteora DLMM trading bots.
 
+> Status note: this README still contains pre-migration architecture details, including Seal-era live wallet flows and executor naming that are no longer the current source of truth.
+>
+> The backend has already migrated away from the old Seal/Sentinel wallet path to per-bot encrypted keypairs. Treat any Seal-specific route, flow, or architecture reference in this document as historical until this README is fully rewritten.
+>
+> Use the root audit at `../SAGE_POST_MIGRATION_AUDIT.md` as the current migration status document.
+
 ## Architecture
 
 ```mermaid
