@@ -19,6 +19,7 @@ import {
   Transaction,
   LAMPORTS_PER_SOL,
 } from "@solana/web3.js";
+import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import { getConnection } from "../services/solana.js";
 import { TransactionSender } from "../engine/transaction-sender.js";
 import { decryptKeypair } from "../engine/crypto-utils.js";
@@ -105,6 +106,7 @@ wallet.get("/address/:botId", requireAuth, async (c) => {
 
 const withdrawSchema = z.object({
   amountSOL: z.number().positive().max(10_000),
+  destination: z.string().min(32).max(50).optional(),
 });
 
 wallet.post(
@@ -117,30 +119,48 @@ wallet.post(
     validateBotId(botId);
 
     const bot = await getLiveBot(userId, botId);
-    const { amountSOL } = c.req.valid("json");
+    const { amountSOL, destination } = c.req.valid("json");
 
-    if (!bot.ownerWallet) {
+    if (!bot.ownerWallet && !destination) {
       throw createApiError(
         "Owner wallet not set — cannot withdraw. Contact support.",
         400
       );
     }
 
+    // Validate destination if provided
+    const destinationAddress = destination ?? bot.ownerWallet!;
+    let destinationPubkey: PublicKey;
+    try {
+      destinationPubkey = new PublicKey(destinationAddress);
+    } catch {
+      throw createApiError("Invalid destination wallet address", 400);
+    }
+
     const connection = getConnection();
     const botPubkey = new PublicKey(bot.walletAddress!);
-    const ownerPubkey = new PublicKey(bot.ownerWallet);
-    const amountLamports = Math.floor(amountSOL * LAMPORTS_PER_SOL);
+    const requestedLamports = Math.floor(amountSOL * LAMPORTS_PER_SOL);
 
-    // Check balance (leave enough for rent + TX fee)
     const balance = await connection.getBalance(botPubkey);
-    const reserveLamports = 10_000; // ~0.00001 SOL for fees
-    if (balance < amountLamports + reserveLamports) {
+
+    // "Drain all" mode: when the user requests >= balance, drain the entire
+    // account to zero.  We skip priority fees for drain TXs (a simple SOL
+    // transfer lands fine with just the 5 000-lamport base fee) so the
+    // account ends up at exactly 0 lamports and gets garbage-collected.
+    const BASE_FEE_LAMPORTS = 5_000; // 1 signature × 5000
+    const isDrain = requestedLamports >= balance - BASE_FEE_LAMPORTS;
+
+    if (balance <= BASE_FEE_LAMPORTS) {
       throw createApiError(
-        `Insufficient balance: ${(balance / LAMPORTS_PER_SOL).toFixed(6)} SOL ` +
-        `(requested ${amountSOL} SOL)`,
+        `Balance too low to cover the transaction fee ` +
+        `(${(balance / LAMPORTS_PER_SOL).toFixed(6)} SOL)`,
         400
       );
     }
+
+    const withdrawLamports = isDrain
+      ? balance - BASE_FEE_LAMPORTS   // drain: send everything minus the base fee
+      : Math.min(requestedLamports, balance - BASE_FEE_LAMPORTS);
 
     // Decrypt keypair, sign, send
     const keypair = decryptKeypair(
@@ -152,14 +172,16 @@ wallet.post(
       const tx = new Transaction().add(
         SystemProgram.transfer({
           fromPubkey: botPubkey,
-          toPubkey: ownerPubkey,
-          lamports: amountLamports,
+          toPubkey: destinationPubkey,
+          lamports: withdrawLamports,
         })
       );
 
       const txSender = new TransactionSender(connection);
-      const txWithFees = txSender.addPriorityFee(tx);
-      const result = await txSender.sendTransaction(txWithFees, [keypair]);
+      // Skip priority fees on drain TXs — maximizes amount sent,
+      // account goes to 0 lamports and gets GC'd by the runtime.
+      const finalTx = isDrain ? tx : txSender.addPriorityFee(tx);
+      const result = await txSender.sendTransaction(finalTx, [keypair]);
 
       if (!result.success) {
         throw createApiError(
@@ -168,12 +190,14 @@ wallet.post(
         );
       }
 
+      const actualSOL = withdrawLamports / LAMPORTS_PER_SOL;
       return c.json({
         success: true,
         signature: result.signature,
-        amountSOL,
+        amountSOL: actualSOL,
+        drained: isDrain,
         from: bot.walletAddress,
-        to: bot.ownerWallet,
+        to: destinationAddress,
       });
     } finally {
       // Zeroize decrypted key material
@@ -233,6 +257,226 @@ wallet.post(
       amountSOL,
       depositAddress: bot.walletAddress,
       network: config.SOLANA_NETWORK || "mainnet-beta",
+    });
+  }
+);
+
+// ═══════════════════════════════════════════════════════════════
+// GET /wallet/balances — All bot wallet balances (SOL + tokens)
+// Aggregates across all live-mode bots for the authenticated user.
+// ═══════════════════════════════════════════════════════════════
+
+wallet.get("/balances", requireAuth, async (c) => {
+  const userId = c.var.userId;
+
+  const rows = await db
+    .select()
+    .from(bots)
+    .where(and(eq(bots.userId, userId), eq(bots.mode, "live")));
+
+  const liveBots = rows.filter(
+    (r) => r.walletAddress && r.encryptedPrivateKey
+  );
+
+  if (liveBots.length === 0) {
+    return c.json({
+      wallets: [],
+      totalSOL: 0,
+      tokenAccounts: [],
+    });
+  }
+
+  const connection = getConnection();
+
+  type WalletInfo = {
+    botId: string;
+    botName: string;
+    walletAddress: string;
+    balanceSOL: number;
+    tokens: { mint: string; amount: number; decimals: number }[];
+  };
+
+  const wallets: WalletInfo[] = [];
+  let totalSOL = 0;
+  const tokenMap = new Map<
+    string,
+    { mint: string; totalAmount: number; decimals: number }
+  >();
+
+  await Promise.all(
+    liveBots.map(async (bot) => {
+      const pubkey = new PublicKey(bot.walletAddress!);
+      let solBalance = 0;
+      const tokens: WalletInfo["tokens"] = [];
+
+      try {
+        solBalance = (await connection.getBalance(pubkey)) / LAMPORTS_PER_SOL;
+      } catch {
+        // If RPC fails for one wallet, continue with others
+      }
+
+      try {
+        const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
+          pubkey,
+          { programId: TOKEN_PROGRAM_ID }
+        );
+
+        for (const { account } of tokenAccounts.value) {
+          const parsed = account.data.parsed?.info;
+          if (!parsed) continue;
+          const mint = parsed.mint as string;
+          const amount = parsed.tokenAmount?.uiAmount ?? 0;
+          const decimals = parsed.tokenAmount?.decimals ?? 0;
+          if (amount > 0) {
+            tokens.push({ mint, amount, decimals });
+
+            const existing = tokenMap.get(mint);
+            if (existing) {
+              existing.totalAmount += amount;
+            } else {
+              tokenMap.set(mint, { mint, totalAmount: amount, decimals });
+            }
+          }
+        }
+      } catch {
+        // Token query failed for this wallet — continue
+      }
+
+      totalSOL += solBalance;
+      wallets.push({
+        botId: bot.botId,
+        botName: bot.name,
+        walletAddress: bot.walletAddress!,
+        balanceSOL: solBalance,
+        tokens,
+      });
+    })
+  );
+
+  return c.json({
+    wallets,
+    totalSOL,
+    tokenAccounts: Array.from(tokenMap.values()),
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// POST /wallet/smart-withdraw — Batch withdraw from multiple wallets
+// Withdraws SOL from selected bot wallets to the owner wallet.
+// ═══════════════════════════════════════════════════════════════
+
+const smartWithdrawSchema = z.object({
+  botIds: z.array(z.string()).min(1).max(50),
+});
+
+wallet.post(
+  "/smart-withdraw",
+  requireAuth,
+  zValidator("json", smartWithdrawSchema),
+  async (c) => {
+    const userId = c.var.userId;
+    const { botIds } = c.req.valid("json");
+
+    const connection = getConnection();
+    const results: {
+      botId: string;
+      success: boolean;
+      signature?: string;
+      amountSOL?: number;
+      error?: string;
+    }[] = [];
+
+    let totalWithdrawn = 0;
+
+    for (const botId of botIds) {
+      try {
+        if (!BOT_ID_REGEX.test(botId)) {
+          results.push({ botId, success: false, error: "Invalid bot ID" });
+          continue;
+        }
+
+        const [row] = await db
+          .select()
+          .from(bots)
+          .where(and(eq(bots.botId, botId), eq(bots.userId, userId)));
+
+        if (!row || row.mode !== "live" || !row.walletAddress || !row.encryptedPrivateKey) {
+          results.push({ botId, success: false, error: "Not a valid live bot" });
+          continue;
+        }
+
+        if (!row.ownerWallet) {
+          results.push({ botId, success: false, error: "No owner wallet set" });
+          continue;
+        }
+
+        const botPubkey = new PublicKey(row.walletAddress);
+        const ownerPubkey = new PublicKey(row.ownerWallet);
+        const balance = await connection.getBalance(botPubkey);
+        const BASE_FEE = 5_000;
+
+        if (balance <= BASE_FEE) {
+          results.push({
+            botId,
+            success: true,
+            amountSOL: 0,
+            signature: undefined,
+          });
+          continue;
+        }
+
+        // Drain entire account — skip priority fees so account → 0 lamports
+        const withdrawLamports = balance - BASE_FEE;
+        const keypair = decryptKeypair(
+          row.encryptedPrivateKey,
+          config.MASTER_ENCRYPTION_KEY
+        );
+
+        try {
+          const tx = new Transaction().add(
+            SystemProgram.transfer({
+              fromPubkey: botPubkey,
+              toPubkey: ownerPubkey,
+              lamports: withdrawLamports,
+            })
+          );
+
+          const txSender = new TransactionSender(connection);
+          // No priority fee — drain TX, account goes to 0
+          const result = await txSender.sendTransaction(tx, [keypair]);
+
+          if (result.success) {
+            const sol = withdrawLamports / LAMPORTS_PER_SOL;
+            totalWithdrawn += sol;
+            results.push({
+              botId,
+              success: true,
+              signature: result.signature,
+              amountSOL: sol,
+            });
+          } else {
+            results.push({
+              botId,
+              success: false,
+              error: result.error ?? "Transaction failed",
+            });
+          }
+        } finally {
+          keypair.secretKey.fill(0);
+        }
+      } catch (e: any) {
+        results.push({
+          botId,
+          success: false,
+          error: e?.message ?? "Unknown error",
+        });
+      }
+    }
+
+    return c.json({
+      success: true,
+      totalWithdrawnSOL: totalWithdrawn,
+      results,
     });
   }
 );

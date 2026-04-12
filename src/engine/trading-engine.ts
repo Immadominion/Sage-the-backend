@@ -285,6 +285,22 @@ export class TradingEngine {
 
       if (balanceSOL < minRequired) {
         const depositNeeded = Math.ceil((minRequired - balanceSOL) * 100) / 100; // round up to 0.01
+
+        if (activePositions.length > 0) {
+          // Still managing active positions — skip opening new ones but
+          // continue the scan cycle so position exit logic keeps running.
+          log.info(
+            {
+              label: this.label,
+              balance: balanceSOL.toFixed(4),
+              active: activePositions.length,
+            },
+            "Low balance but active positions open — skipping new entries, managing exits"
+          );
+          return;
+        }
+
+        // No active positions AND no capital to open new ones — surface error
         log.warn(
           {
             label: this.label,
@@ -298,6 +314,26 @@ export class TradingEngine {
           type: "engine:error",
           error: `insufficient_balance:${balanceSOL.toFixed(6)}:${minRequired.toFixed(2)}:${depositNeeded.toFixed(2)}`,
         });
+        return;
+      }
+
+      // Cap concurrent positions to what the wallet can actually afford.
+      // E.g. 0.5 SOL balance → max 2 positions at 0.1 + 0.07 rent/fees each.
+      const affordableSlots = Math.floor(balanceSOL / minRequired);
+      const effectiveMaxPositions = Math.min(
+        this.config.maxConcurrentPositions,
+        affordableSlots + activePositions.length,
+      );
+      if (activePositions.length >= effectiveMaxPositions) {
+        log.debug(
+          {
+            label: this.label,
+            active: activePositions.length,
+            affordable: affordableSlots,
+            max: this.config.maxConcurrentPositions,
+          },
+          "At capacity for current balance, skipping scan"
+        );
         return;
       }
 
@@ -336,7 +372,7 @@ export class TradingEngine {
       // Score, rank, and optionally apply ML predictions
       const strategyMode = this.config.strategyMode ?? "rule-based";
       const slotsAvailable =
-        this.config.maxConcurrentPositions - activePositions.length;
+        effectiveMaxPositions - activePositions.length;
 
       let topPools: { pool: MeteoraPairData; score: MarketScore; mlPrediction?: MLPrediction; mlFeatures?: V3Features }[] = [];
 

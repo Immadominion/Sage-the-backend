@@ -8,6 +8,7 @@
  * POST   /bot/:botId/start   — start bot
  * POST   /bot/:botId/stop    — stop bot
  * POST   /bot/:botId/emergency — emergency close all positions
+ * POST   /bot/:botId/convert-to-live — convert simulation to live
  * DELETE /bot/:botId         — delete stopped bot
  */
 
@@ -633,6 +634,78 @@ bot.post("/:botId/emergency", async (c) => {
   await orchestrator.emergencyStop(botId);
 
   return c.json({ success: true, status: "emergency_stopped" });
+});
+
+/**
+ * POST /bot/:botId/convert-to-live
+ * Convert a simulation bot to live mode.
+ * Generates an encrypted keypair and resets stats.
+ * Bot must be stopped and currently in simulation mode.
+ */
+bot.post("/:botId/convert-to-live", async (c) => {
+  const userId = c.var.userId;
+  const botId = c.req.param("botId");
+  validateBotId(botId);
+
+  const botData = await getUserBot(userId, botId);
+  if (!botData) {
+    throw createApiError("Bot not found", 404);
+  }
+
+  if (botData.mode === "live") {
+    throw createApiError("Bot is already in live mode", 400);
+  }
+
+  if (botData.status === "running" || botData.status === "starting" || botData.status === "stopping") {
+    throw createApiError("Stop the bot before converting to live mode", 400);
+  }
+
+  if (config.SOLANA_NETWORK !== "mainnet-beta") {
+    throw createApiError(
+      `Live trading requires mainnet (current network: ${config.SOLANA_NETWORK}). ` +
+      `Use simulation mode for testing on ${config.SOLANA_NETWORK}.`,
+      400
+    );
+  }
+
+  // Generate encrypted keypair for the live bot
+  const { publicKey, encryptedSecret } = generateEncryptedKeypair(
+    config.MASTER_ENCRYPTION_KEY
+  );
+
+  // Get owner wallet from user record
+  const [user] = await db
+    .select({ walletAddress: users.walletAddress })
+    .from(users)
+    .where(eq(users.id, userId));
+
+  await db.update(bots)
+    .set({
+      mode: "live",
+      walletAddress: publicKey,
+      encryptedPrivateKey: encryptedSecret,
+      ownerWallet: user?.walletAddress ?? null,
+      // Reset stats for fresh live start
+      totalTrades: 0,
+      winningTrades: 0,
+      totalPnlLamports: 0,
+      currentVirtualBalanceLamports: null,
+      emergencyStopState: null,
+      status: "stopped",
+      updatedAt: new Date(),
+    })
+    .where(and(eq(bots.botId, botId), eq(bots.userId, userId)));
+
+  await db.insert(tradeLog)
+    .values({
+      botId,
+      userId,
+      event: "bot_started",
+      details: JSON.stringify({ action: "converted_to_live", previousMode: "simulation" }),
+    });
+
+  const updated = await getUserBot(userId, botId);
+  return c.json({ success: true, bot: sanitizeBot(updated!) });
 });
 
 /**
