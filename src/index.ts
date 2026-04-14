@@ -1,7 +1,7 @@
 /**
- * Sage Backend — Main entry point
+ * Aura Backend — Main entry point
  *
- * Hono on Node.js server providing REST API for the Sage mobile app.
+ * Hono on Node.js server providing REST API for the Aura mobile app.
  *
  * Architecture:
  *  - Auth:    SIWS (Sign-In With Solana) → JWT
@@ -35,6 +35,7 @@ import eventsRoutes from "./routes/events.js";
 import positionRoutes from "./routes/position.js";
 import aiRoutes from "./routes/ai.js";
 import fleetRoutes from "./routes/fleet.js";
+import analyticsRoutes from "./routes/analytics.js";
 
 // Engine
 import { orchestrator } from "./engine/orchestrator.js";
@@ -112,6 +113,7 @@ app.use("/ai/conversations", readRateLimit);
 app.use("/ai/conversations/*", readRateLimit);
 app.use("/ai/status", readRateLimit);
 app.use("/fleet/*", readRateLimit);
+app.use("/analytics/*", readRateLimit);
 app.use("/bot/list", readRateLimit);
 app.use("/wallet/*", readRateLimit);
 
@@ -126,6 +128,7 @@ app.route("/events", eventsRoutes);
 app.route("/position", positionRoutes);
 app.route("/ai", aiRoutes);
 app.route("/fleet", fleetRoutes);
+app.route("/analytics", analyticsRoutes);
 
 // ── 404 ──
 app.notFound((c) => c.json({
@@ -149,7 +152,7 @@ const server = serve(
   },
   (info) => {
     logger.info("═".repeat(60));
-    logger.info("  Sage Backend API");
+    logger.info("  Aura Backend API");
     logger.info("═".repeat(60));
     logger.info(`  Port:      ${info.port}`);
     logger.info(`  Network:   ${config.SOLANA_NETWORK}`);

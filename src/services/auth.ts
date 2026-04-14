@@ -120,12 +120,12 @@ export function buildSIWSMessage(
   issuedAt: string
 ): string {
   return [
-    `sage.scrolls.fun wants you to sign in with your Solana account:`,
+    `useaura.wtf wants you to sign in with your Solana account:`,
     walletAddress,
     ``,
-    `Sign in to Sage — your autonomous LP trading agent.`,
+    `Sign in to Aura — your autonomous LP trading agent.`,
     ``,
-    `URI: https://sage.scrolls.fun`,
+    `URI: https://useaura.wtf`,
     `Version: 1`,
     `Chain ID: ${config.SOLANA_NETWORK === "mainnet-beta" ? "mainnet" : config.SOLANA_NETWORK}`,
     `Nonce: ${nonce}`,

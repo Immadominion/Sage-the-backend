@@ -1,7 +1,7 @@
 {
-  "name": "@sage/backend",
+  "name": "@aura/backend",
   "version": "0.1.0",
-  "description": "Sage Backend — LP Intelligence Platform API",
+  "description": "Aura Backend — LP Intelligence Platform API",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
@@ -20,7 +20,7 @@
     "meteora",
     "lp",
     "trading",
-    "sage"
+    "aura"
   ],
   "author": "",
   "license": "Apache-2.0",
