@@ -256,7 +256,7 @@ describe("E2E: simulated-user activation flow", () => {
 
         expect(sseText).toContain("event: connected");
         expect(sseText).toContain(`"userId":${TEST_USER_ID}`);
-        expect(sseText).toContain("Connected to Sage event stream");
+        expect(sseText).toContain("Connected to Aura event stream");
     });
 
     it("auto-clamps impossible small-capital configs", async () => {

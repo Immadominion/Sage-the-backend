@@ -26,7 +26,8 @@ import type {
   BotConfig,
   IMarketDataProvider,
 } from "./types.js";
-import { LAMPORTS_PER_SOL } from "./types.js";
+import { LAMPORTS_PER_SOL, SOL_MINT } from "./types.js";
+import { getSolPriceUsd, getSolPriceUsdSync } from "./sol-price.js";
 import {
   computeBinBounds,
   distributeAcrossBins,
@@ -87,6 +88,16 @@ export class SimulationExecutor implements ITradingExecutor {
       const poolData = await this.marketData.getPoolData(poolAddress);
       if (!poolData) {
         return { success: false, error: "Pool not found" };
+      }
+
+      // Sim only supports SOL-quoted pools (Y = WSOL). Cross-quoted pools
+      // would silently be denominated as SOL — the root cause of inflated
+      // P&L numbers seen on the dashboard. Refuse instead.
+      if (poolData.mint_y !== SOL_MINT) {
+        return {
+          success: false,
+          error: `SIM_NON_SOL_QUOTE: ${poolData.name} mint_y=${poolData.mint_y}`,
+        };
       }
 
       const activeBin = await this.marketData.getActiveBin(poolAddress);
@@ -442,29 +453,35 @@ export class SimulationExecutor implements ITradingExecutor {
     if (hoursSinceLastUpdate <= 0) return 0;
 
     // Use entry features for pool fee rate (from the scan that triggered entry)
-    // This gives us real fee data from the Meteora API without an extra fetch
     const feeRate = position.entryFeatures
       ? this.deriveFeeRateFromFeatures(position.entryFeatures)
-      : 0.001; // Conservative default: 0.1%
+      : 0.001;
 
-    // LP's share ≈ position liquidity / total pool liquidity
-    // We estimate this from the position's entry value relative to pool liquidity
-    const poolLiquidity = position.entryFeatures?.liquidity ?? 1_000_000;
+    // LP share. `liquidity` from the Meteora API is **USD TVL** and
+    // entryValueSol is in SOL — so we must convert one to the other before
+    // dividing. Use live SOL price (cached 60s); falls back to env or 150
+    // if the price feed is unreachable. Clamp share to ≤1% to prevent
+    // runaway credits when pool TVL is stale or zero.
+    void getSolPriceUsd(); // fire-and-forget refresh of the cache
+    const solPriceUsd = getSolPriceUsdSync();
+    const MAX_LP_SHARE = 0.01;
+    const poolLiquidityUsd = position.entryFeatures?.liquidity ?? 0;
+    const poolLiquiditySol = poolLiquidityUsd > 0
+      ? poolLiquidityUsd / solPriceUsd
+      : 0;
     const entryValueSol =
       position.entryAmountX.add(position.entryAmountY).toNumber() /
       LAMPORTS_PER_SOL;
-    const lpShare = Math.min(entryValueSol / poolLiquidity, 1);
+    const lpShare = poolLiquiditySol > 0
+      ? Math.min(MAX_LP_SHARE, entryValueSol / poolLiquiditySol)
+      : 0;
 
-    // Volume-based fee estimation:
-    //   fees = volumePerHour × feeRate × lpShare × hours
-    const volumePerHour = position.entryFeatures?.volume_1h ?? 0;
-    const feesLamports = Math.floor(
-      volumePerHour *
-      feeRate *
-      lpShare *
-      hoursSinceLastUpdate *
-      LAMPORTS_PER_SOL
-    );
+    // Volume-based fee estimation: USD volume × feeRate × lpShare × hours
+    // gives **USD fees**; convert to SOL lamports via SOL price.
+    const volumePerHourUsd = position.entryFeatures?.volume_1h ?? 0;
+    const feesUsd = volumePerHourUsd * feeRate * lpShare * hoursSinceLastUpdate;
+    const feesSol = feesUsd / solPriceUsd;
+    const feesLamports = Math.floor(feesSol * LAMPORTS_PER_SOL);
 
     return Math.max(0, feesLamports);
   }

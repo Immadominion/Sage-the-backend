@@ -1,5 +1,5 @@
 /**
- * Sage Backend — Environment configuration with Zod validation.
+ * Aura Backend — Environment configuration with Zod validation.
  *
  * All env vars are validated at startup. If any are missing or invalid,
  * the process exits immediately with a clear error message.
@@ -28,14 +28,14 @@ const envSchema = z.object({
   JWT_SECRET: z
     .string()
     .min(32, "JWT_SECRET must be at least 32 characters"),
-  JWT_ISSUER: z.string().default("sage-backend"),
+  JWT_ISSUER: z.string().default("aura-backend"),
   JWT_ACCESS_TTL: z.string().default(process.env.NODE_ENV === "production" ? "15m" : "24h"),
   JWT_REFRESH_TTL: z.string().default(process.env.NODE_ENV === "production" ? "7d" : "30d"),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace"]).default("info"),
   DATABASE_URL: z.string().default(
     process.env.NODE_ENV === "production"
-      ? "postgresql://localhost:5432/sage"
-      : "postgresql://localhost:5432/sage_dev"
+      ? "postgresql://localhost:5432/aura"
+      : "postgresql://localhost:5432/aura_dev"
   ),
   CORS_ORIGINS: z.string().default("*"),
   HELIUS_API_KEY: z.string().optional(),
@@ -43,6 +43,10 @@ const envSchema = z.object({
     .string()
     .url()
     .default("https://dlmm.datapi.meteora.ag"),
+  LP_AGENT_API_KEY: z
+    .string()
+    .optional()
+    .describe("LP Agent API key for bounty endpoints (zap in/out + data APIs)"),
   WALLET_PATH: z
     .string()
     .optional()

@@ -19,8 +19,8 @@ import crypto from "node:crypto";
 import { createApiError } from "../middleware/error.js";
 import { generateEncryptedKeypair } from "../engine/crypto-utils.js";
 import db from "../db/index.js";
-import { bots, users, positions, tradeLog } from "../db/schema.js";
-import { eq, and, sql, isNull } from "drizzle-orm";
+import { bots, users, positions, tradeLog, botDecisions } from "../db/schema.js";
+import { eq, and, sql, isNull, desc } from "drizzle-orm";
 import { orchestrator } from "../engine/orchestrator.js";
 import { requireAuth, type AuthVariables } from "../middleware/auth.js";
 import { LAMPORTS_PER_SOL } from "../engine/types.js";
@@ -39,7 +39,7 @@ bot.use("/*", requireAuth);
 const baseBotConfigSchema = z.object({
   name: z.string().min(1).max(64).optional(),
   mode: z.enum(["simulation", "live"]).default("simulation"),
-  strategyMode: z.enum(["rule-based", "sage-ai", "both"]).default("rule-based"),
+  strategyMode: z.enum(["rule-based", "aura-ai", "both"]).default("rule-based"),
   // Entry criteria
   entryScoreThreshold: z.number().positive().default(150),
   /** ML probability threshold override (0-1). Omit to use model default. */
@@ -762,6 +762,37 @@ bot.delete("/:botId", async (c) => {
       : { fundsReturned: false }
     ),
   });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// GET /bot/:botId/decisions — Decision log for a bot
+// ═══════════════════════════════════════════════════════════════
+bot.get("/:botId/decisions", async (c) => {
+  const userId = c.get("userId");
+  const botId = c.req.param("botId");
+  const scanId = c.req.query("scanId");
+  const limit = Math.min(Number(c.req.query("limit") || 50), 100);
+  const offset = Number(c.req.query("offset") || 0);
+
+  // Verify bot belongs to user
+  const [bot_] = await db
+    .select({ botId: bots.botId })
+    .from(bots)
+    .where(and(eq(bots.botId, botId), eq(bots.userId, userId)));
+  if (!bot_) throw createApiError("Bot not found", 404);
+
+  const conditions = [eq(botDecisions.botId, botId)];
+  if (scanId) conditions.push(eq(botDecisions.scanId, scanId));
+
+  const rows = await db
+    .select()
+    .from(botDecisions)
+    .where(and(...conditions))
+    .orderBy(desc(botDecisions.id))
+    .limit(limit)
+    .offset(offset);
+
+  return c.json({ success: true, decisions: rows });
 });
 
 export default bot;

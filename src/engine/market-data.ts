@@ -241,6 +241,10 @@ export class MarketDataProvider implements IMarketDataProvider {
         if (!isSOLPair) return false;
       }
 
+      // Simulator only handles mint_y=WSOL pools (SOL-USDC has mint_x=SOL,
+      // mint_y=USDC and would be rejected at openPosition). Pre-filter here.
+      if (config.requireSolQuote && pool.mint_y !== SOL_MINT) return false;
+
       if (pool.mint_x && config.blacklist.includes(pool.mint_x)) return false;
       if (pool.mint_y && config.blacklist.includes(pool.mint_y)) return false;
 

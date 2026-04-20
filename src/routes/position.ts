@@ -14,7 +14,7 @@ import { z } from "zod";
 import { eq, and, desc } from "drizzle-orm";
 import { PublicKey } from "@solana/web3.js";
 import db from "../db/index.js";
-import { positions } from "../db/schema.js";
+import { positions, botDecisions } from "../db/schema.js";
 import { requireAuth, type AuthVariables } from "../middleware/auth.js";
 import { createApiError } from "../middleware/error.js";
 import { orchestrator } from "../engine/orchestrator.js";
@@ -251,17 +251,15 @@ app.get("/:positionId", async (c) => {
 // ═══════════════════════════════════════════════════════════════
 
 function formatPositionRow(row: typeof positions.$inferSelect) {
-  const entryPrice = row.entryPricePerToken
-    ? parseFloat(row.entryPricePerToken)
-    : 0;
-  const exitPrice = row.exitPricePerToken
-    ? parseFloat(row.exitPricePerToken)
-    : null;
-  const pnlPercent = exitPrice
-    ? ((exitPrice - entryPrice) / entryPrice) * 100
-    : 0;
   const pnlSol = row.realizedPnlLamports
     ? row.realizedPnlLamports / LAMPORTS_PER_SOL
+    : 0;
+  // P&L % must match pnlSol — use realized P&L / entry capital, NOT price change.
+  // Entry capital = amountX + amountY (both in lamports, SOL-denominated).
+  const entryCapitalLamports =
+    (row.entryAmountXLamports ?? 0) + (row.entryAmountYLamports ?? 0);
+  const pnlPercent = entryCapitalLamports > 0 && row.realizedPnlLamports
+    ? (row.realizedPnlLamports / entryCapitalLamports) * 100
     : 0;
 
   return {
@@ -447,6 +445,30 @@ app.post("/reconcile", async (c) => {
     total: activeRows.length,
     details,
   });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// GET /position/:positionId/decision — Why was this position opened?
+// ═══════════════════════════════════════════════════════════════
+app.get("/:positionId/decision", async (c) => {
+  const userId = c.get("userId");
+  const positionId = c.req.param("positionId");
+
+  const [row] = await db
+    .select()
+    .from(botDecisions)
+    .where(
+      and(
+        eq(botDecisions.positionId, positionId),
+        eq(botDecisions.userId, userId),
+        eq(botDecisions.decision, "entered")
+      )
+    )
+    .limit(1);
+
+  if (!row) throw createApiError("Decision not found for this position", 404);
+
+  return c.json({ success: true, decision: row });
 });
 
 export default app;

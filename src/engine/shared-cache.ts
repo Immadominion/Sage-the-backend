@@ -125,7 +125,7 @@ class SharedAPICache {
           signal: controller.signal,
           headers: {
             accept: "application/json",
-            "user-agent": "sage-backend/0.3",
+            "user-agent": "aura-backend/0.3",
           },
         });
         clearTimeout(timeout);

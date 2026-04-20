@@ -20,11 +20,11 @@ import { Connection } from "@solana/web3.js";
 import BN from "bn.js";
 import config from "../config.js";
 import db from "../db/index.js";
-import { bots, positions, tradeLog } from "../db/schema.js";
-import { eq, and } from "drizzle-orm";
+import { bots, positions, tradeLog, botDecisions } from "../db/schema.js";
+import { eq, and, lt } from "drizzle-orm";
 import { logger } from "../middleware/logger.js";
 import { eventBus } from "./event-bus.js";
-import { TradingEngine, type EngineEvent, type EngineStats } from "./trading-engine.js";
+import { TradingEngine, type EngineEvent, type EngineStats, type ScanDecision } from "./trading-engine.js";
 import { SimulationExecutor } from "./simulation-executor.js";
 import { BotKeypairExecutor } from "./bot-keypair-executor.js";
 import { MarketDataProvider } from "./market-data.js";
@@ -138,7 +138,7 @@ export class BotOrchestrator {
 
     // Create MLPredictor if bot uses AI mode
     const strategyMode = (botRow.strategyMode ?? "rule-based") as StrategyMode;
-    const needsML = strategyMode === "sage-ai" || strategyMode === "both";
+    const needsML = strategyMode === "aura-ai" || strategyMode === "both";
     const mlPredictor = needsML ? this.sharedMLPredictor : null;
 
     if (needsML) {
@@ -637,7 +637,7 @@ export class BotOrchestrator {
         this.onPositionUpdated(botId, userId, event.position);
         break;
       case "scan:completed":
-        this.onScanCompleted(botId, userId, event.eligible, event.entered);
+        this.onScanCompleted(botId, userId, event.eligible, event.entered, event.scanId, event.decisions);
         break;
       case "engine:started":
         eventBus.emitBotEvent("engine:started", botId, userId);
@@ -879,7 +879,9 @@ export class BotOrchestrator {
     botId: string,
     userId: number,
     eligible: number,
-    entered: number
+    entered: number,
+    scanId: string,
+    decisions: ScanDecision[]
   ): Promise<void> {
     // Always emit scan events so the app can update stats in real time
     eventBus.emitBotEvent("scan:completed", botId, userId, {
@@ -895,6 +897,64 @@ export class BotOrchestrator {
         updatedAt: new Date(),
       })
       .where(eq(bots.botId, botId));
+
+    // Persist per-pool decisions to bot_decisions table (cap at top 20 per scan)
+    if (decisions.length > 0) {
+      try {
+        // Keep the most relevant: all entered + watched + top skipped by score
+        const entered = decisions.filter((d) => d.decision === "entered");
+        const watched = decisions.filter((d) => d.decision === "watched");
+        const skipped = decisions
+          .filter((d) => d.decision === "skipped" && d.ruleScore != null)
+          .sort((a, b) => (b.ruleScore ?? 0) - (a.ruleScore ?? 0))
+          .slice(0, 10);
+        const toInsert = [...entered, ...watched, ...skipped].slice(0, 20);
+
+        if (toInsert.length > 0) {
+          await db.insert(botDecisions).values(
+            toInsert.map((d) => ({
+              botId,
+              userId,
+              scanId,
+              poolAddress: d.poolAddress,
+              poolName: d.poolName,
+              decision: d.decision,
+              reason: d.reason,
+              ruleScore: d.ruleScore ?? null,
+              mlProbability: d.mlProbability ?? null,
+              scoreBreakdown: d.scoreBreakdown ?? null,
+              features: d.features ?? null,
+              positionId: d.positionId ?? null,
+            }))
+          );
+        }
+
+        // Prune old decisions — keep last 500 per bot
+        const countResult = await db
+          .select({ id: botDecisions.id })
+          .from(botDecisions)
+          .where(eq(botDecisions.botId, botId))
+          .orderBy(botDecisions.id)
+          .limit(1)
+          .offset(500);
+
+        if (countResult.length > 0) {
+          await db
+            .delete(botDecisions)
+            .where(
+              and(
+                eq(botDecisions.botId, botId),
+                lt(botDecisions.id, countResult[0].id)
+              )
+            );
+        }
+      } catch (err) {
+        log.error(
+          { botId, err: err instanceof Error ? err.message : String(err) },
+          "Failed to persist scan decisions"
+        );
+      }
+    }
   }
 
   // ── Engine Error ──
@@ -969,6 +1029,7 @@ export class BotOrchestrator {
 
       // Token filtering
       solPairsOnly: true,
+      requireSolQuote: row.mode !== "live", // sim math requires mint_y === WSOL
       blacklist: [],
 
       // Position sizing

@@ -25,7 +25,7 @@ import { eq } from "drizzle-orm";
 // Types
 // ═══════════════════════════════════════════════════════════════
 
-export interface SageJWTPayload extends JWTPayload {
+export interface AuraJWTPayload extends JWTPayload {
   sub: string; // wallet address
   userId: number;
 }
@@ -249,7 +249,7 @@ export async function issueTokens(
   const accessToken = await new SignJWT({
     sub: walletAddress,
     userId,
-  } satisfies SageJWTPayload)
+  } satisfies AuraJWTPayload)
     .setProtectedHeader({ alg: "HS256" })
     .setIssuedAt()
     .setIssuer(config.JWT_ISSUER)
@@ -287,11 +287,11 @@ export async function issueTokens(
 /** Verify a JWT access token and return the payload. */
 export async function verifyAccessToken(
   token: string
-): Promise<SageJWTPayload> {
+): Promise<AuraJWTPayload> {
   const { payload } = await jwtVerify(token, JWT_SECRET, {
     issuer: config.JWT_ISSUER,
   });
-  return payload as SageJWTPayload;
+  return payload as AuraJWTPayload;
 }
 
 /** Verify a refresh token, issue new tokens (rotation). */

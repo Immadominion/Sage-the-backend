@@ -1,5 +1,5 @@
 /**
- * Rate limiting middleware for the Sage Backend.
+ * Rate limiting middleware for the Aura Backend.
  *
  * Uses hono-rate-limiter with in-memory store (sufficient for single-process).
  * Different tiers for different endpoint groups:

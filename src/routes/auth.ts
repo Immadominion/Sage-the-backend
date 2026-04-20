@@ -20,7 +20,7 @@ import {
 import { requireAuth, type AuthVariables } from "../middleware/auth.js";
 import { createApiError } from "../middleware/error.js";
 import db from "../db/index.js";
-import { users, bots } from "../db/schema.js";
+import { users, bots, deviceTokens } from "../db/schema.js";
 import { eq } from "drizzle-orm";
 
 const auth = new Hono<{ Variables: AuthVariables }>();
@@ -235,7 +235,7 @@ auth.get("/me", requireAuth, async (c) => {
 
 const setupProgressSchema = z.object({
   step: z.number().int().min(0).max(2),
-  path: z.enum(["sage-ai", "custom"]).nullable().optional(),
+  path: z.enum(["aura-ai", "custom"]).nullable().optional(),
   execMode: z.enum(["simulation", "live"]).nullable().optional(),
   useAiChat: z.boolean().optional(),
   params: z.object({
@@ -288,6 +288,86 @@ auth.delete("/setup-progress", requireAuth, async (c) => {
       updatedAt: new Date(),
     })
     .where(eq(users.walletAddress, walletAddress));
+
+  return c.json({ success: true });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// Device Token (FCM Push Notifications)
+// ═══════════════════════════════════════════════════════════════
+
+const deviceTokenSchema = z.object({
+  token: z.string().min(1).max(4096),
+  platform: z.enum(["ios", "android"]),
+});
+
+/**
+ * POST /auth/device-token — Register or update an FCM device token.
+ *
+ * Upserts: if the token already exists (e.g. same device re-registering),
+ * the record is updated. A single user can have multiple device tokens
+ * (phone + tablet).
+ */
+auth.post(
+  "/device-token",
+  requireAuth,
+  zValidator("json", deviceTokenSchema),
+  async (c) => {
+    const walletAddress = c.var.walletAddress;
+    const { token, platform } = c.req.valid("json");
+
+    // Get user ID
+    const [user] = await db
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.walletAddress, walletAddress))
+      .limit(1);
+
+    if (!user) {
+      throw createApiError("User not found", 404);
+    }
+
+    // Upsert: insert or update if token already exists
+    await db
+      .insert(deviceTokens)
+      .values({
+        userId: user.id,
+        token,
+        platform,
+        updatedAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: deviceTokens.token,
+        set: {
+          userId: user.id,
+          platform,
+          updatedAt: new Date(),
+        },
+      });
+
+    return c.json({ success: true });
+  }
+);
+
+/**
+ * DELETE /auth/device-token — Unregister all device tokens for the current user.
+ *
+ * Called on logout to stop push notifications.
+ */
+auth.delete("/device-token", requireAuth, async (c) => {
+  const walletAddress = c.var.walletAddress;
+
+  const [user] = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.walletAddress, walletAddress))
+    .limit(1);
+
+  if (user) {
+    await db
+      .delete(deviceTokens)
+      .where(eq(deviceTokens.userId, user.id));
+  }
 
   return c.json({ success: true });
 });

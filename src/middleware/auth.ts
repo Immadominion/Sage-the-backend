@@ -7,12 +7,12 @@
 
 import { createMiddleware } from "hono/factory";
 import { HTTPException } from "hono/http-exception";
-import { verifyAccessToken, type SageJWTPayload } from "../services/auth.js";
+import { verifyAccessToken, type AuraJWTPayload } from "../services/auth.js";
 
 export type AuthVariables = {
   userId: number;
   walletAddress: string;
-  jwtPayload: SageJWTPayload;
+  jwtPayload: AuraJWTPayload;
 };
 
 /**

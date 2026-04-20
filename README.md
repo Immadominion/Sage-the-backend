@@ -1,10 +1,10 @@
-# Sage Backend
+# Aura Backend
 
-REST API backend for the Sage LP Intelligence Platform — powering the Sage mobile app's autonomous Meteora DLMM trading bots.
+REST API backend for the Aura LP Intelligence Platform — powering the Aura mobile app's autonomous Meteora DLMM trading bots.
 
-> Status note: this README still contains pre-migration architecture details, including Seal-era live wallet flows and executor naming that are no longer the current source of truth.
+> Status note: this README still contains pre-migration architecture details, including legacy live wallet flows and executor naming that are no longer the current source of truth.
 >
-> The backend has already migrated away from the old Seal/Sentinel wallet path to per-bot encrypted keypairs. Treat any Seal-specific route, flow, or architecture reference in this document as historical until this README is fully rewritten.
+> The backend has already migrated away from the legacy wallet path to per-bot encrypted keypairs. Treat any legacy route, flow, or architecture reference in this document as historical until this README is fully rewritten.
 >
 > Use the root audit at `../SAGE_POST_MIGRATION_AUDIT.md` as the current migration status document.
 
@@ -13,7 +13,7 @@ REST API backend for the Sage LP Intelligence Platform — powering the Sage mob
 ```mermaid
 graph TB
     subgraph Client
-        APP["Sage Mobile App<br/>(Flutter)"]
+        APP["Aura Mobile App<br/>(Flutter)"]
     end
 
     subgraph Server["Hono HTTP Server (Node.js)"]
@@ -113,7 +113,7 @@ graph TB
 ### Setup
 
 ```bash
-cd sage-backend
+cd aura-backend
 
 # Install dependencies
 npm install
@@ -133,7 +133,7 @@ npm run dev
 ```bash
 # Minimum required — server won't start without these
 JWT_SECRET="your-secret-at-least-32-characters-long"
-DATABASE_URL="postgresql://user:pass@localhost:5432/sage_dev"
+DATABASE_URL="postgresql://user:pass@localhost:5432/aura_dev"
 SOLANA_RPC_URL="https://your-helius-rpc-endpoint.com"
 
 # Optional — for full functionality
@@ -207,11 +207,11 @@ Authorization: Bearer <access_token>
 | POST   | `/ai/chat`              | AI strategy conversation                 | 30/min         |
 | POST   | `/ai/transcribe`        | Voice-to-text (25MB max)                 | 30/min         |
 | GET    | `/fleet/leaderboard`    | Public bot leaderboard                   | 100/min        |
-| POST   | `/wallet/prepare-create`| Prepare Seal wallet creation TX      | 10/min         |
+| POST   | `/wallet/prepare-create`| Prepare bot wallet creation TX       | 10/min         |
 | POST   | `/wallet/prepare-register-agent` | Prepare per-bot agent registration TX | 10/min   |
-| POST   | `/wallet/prepare-deposit`| Prepare deposit TX for Seal wallet  | 10/min         |
-| GET    | `/wallet/state`         | On-chain Seal wallet state           | 100/min        |
-| GET    | `/wallet/balance`       | Seal wallet SOL balance              | 100/min        |
+| POST   | `/wallet/prepare-deposit`| Prepare deposit TX for bot wallet   | 10/min         |
+| GET    | `/wallet/state`         | On-chain bot wallet state            | 100/min        |
+| GET    | `/wallet/balance`       | Bot wallet SOL balance               | 100/min        |
 | GET    | `/wallet/sponsor-status`| Check if sponsored mode available        | 100/min        |
 
 ### SSE Events (GET /events/stream)
@@ -248,7 +248,7 @@ Real-time updates pushed to the client:
 - **EmergencyStop state** persisted as JSON on bots table — survives restarts
 - **Virtual balance** persisted on every trade — simulation balance is always accurate
 - **Bigint for lamports** — no floating point for financial amounts
-- **Per-bot Seal agent** — `agentPubkey`, `agentConfigAddress`, `sessionAddress` columns on `bots` table link each live bot to its on-chain Seal agent PDA
+- **Per-bot encrypted keypair** — `agentPubkey`, `agentConfigAddress`, `sessionAddress` columns on `bots` table link each live bot to its bot wallet
 
 ## Engine Architecture
 
@@ -300,7 +300,7 @@ npm start
 ## Project Structure
 
 ```
-sage-backend/
+aura-backend/
 ├── drizzle/                  # Generated SQL migrations
 ├── src/
 │   ├── config.ts             # Zod-validated environment config

@@ -2,7 +2,7 @@
  * BotKeypairExecutor — Executes REAL transactions on Meteora DLMM
  * using an encrypted bot keypair (AES-256-GCM at rest).
  *
- * This replaces SealExecutor. Each bot gets its own Solana keypair
+ * Each bot gets its own Solana keypair
  * with the private key encrypted in the database. No on-chain wallet
  * program, no CPI wrapping, no session expiry — just direct signing.
  *

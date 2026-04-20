@@ -41,7 +41,7 @@ events.get("/stream", async (c) => {
       data: JSON.stringify({
         userId,
         timestamp: Date.now(),
-        message: "Connected to Sage event stream",
+        message: "Connected to Aura event stream",
       }),
     });
 

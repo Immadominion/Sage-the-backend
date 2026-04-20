@@ -139,11 +139,11 @@ export function distributeAcrossBins(
         const price = computeBinPrice(binId, binStep);
         const c = computeCompositionFactor(binId, activeBinId, binStep);
 
-        // Per DLMM constant-sum: P·x + y = L, c = y/L
-        // So y = c * L and x = (1-c) * L / P
-        // Since binAmount represents total value: binAmount ≈ L
+        // Per DLMM constant-sum: P·x + y = L, c = y/L (L denominated in Y)
+        //   y = c · L  (Y base units)
+        //   x = (1 - c) · L / P  (X base units; rehydrated to Y at exit via current P)
         const yAmount = binAmount * c;
-        const xAmount = binAmount * (1 - c);
+        const xAmount = price > 0 ? (binAmount * (1 - c)) / price : 0;
 
         bins.push({
             binId,
@@ -213,11 +213,14 @@ export function recomputeBinComposition(
         const price = computeBinPrice(bin.binId, binStep);
         const L = bin.liquidity;
 
+        // L is in Y base units; the X portion must be in X base units so
+        // computeLPValueInY (which multiplies xAmount by current P) round-trips
+        // value correctly when the active bin moves.
         return {
             ...bin,
             price,
             yAmount: Math.floor(L * c),
-            xAmount: Math.floor(L * (1 - c)),
+            xAmount: price > 0 ? Math.floor((L * (1 - c)) / price) : 0,
         };
     });
 }
@@ -325,14 +328,17 @@ export function estimateFeeAccrual(
     totalActiveBinLiquidity: number,
     timeHours: number,
     isInRange: boolean,
+    maxShare: number = 0.01,
 ): number {
     if (!isInRange) return 0;
     if (totalActiveBinLiquidity <= 0) return 0;
     if (timeHours <= 0) return 0;
 
     const ourShare = positionLiquidityInActiveBin / totalActiveBinLiquidity;
-    // Clamp share to [0, 1] — can't earn more than 100% of pool fees
-    const clampedShare = Math.min(1, Math.max(0, ourShare));
+    // Clamp to a realistic LP fraction. Real positions on the pools the bot
+    // trades are almost never >1% of TVL; a hard cap prevents runaway fee
+    // credits when liquidity inputs are stale or in the wrong unit.
+    const clampedShare = Math.min(maxShare, Math.max(0, ourShare));
 
     return Math.floor(poolFeeRatePerHourLamports * clampedShare * timeHours);
 }

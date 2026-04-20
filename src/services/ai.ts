@@ -1,5 +1,5 @@
 /**
- * Sage AI Service — Claude LLM + OpenAI STT
+ * Aura AI Service — Claude LLM + OpenAI STT
  *
  * Wraps Anthropic Claude (strategy config + portfolio advice) and
  * OpenAI speech-to-text (gpt-4o-mini-transcribe).
@@ -440,7 +440,7 @@ class AiService {
             logger.error({ error }, "Claude API error");
             const status = error?.status ?? error?.error?.status;
             if (status === 529 || error?.message?.includes("Overloaded")) {
-                throw new Error("Sage is busy right now — please try again in a few seconds.");
+                throw new Error("Aura is busy right now — please try again in a few seconds.");
             }
             throw new Error(
                 `AI service error: ${error instanceof Error ? error.message : String(error)}`

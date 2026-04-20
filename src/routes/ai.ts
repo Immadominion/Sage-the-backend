@@ -1,7 +1,7 @@
 /**
- * Sage AI Routes — Chat (Claude) + Transcribe (OpenAI STT) + Conversations
+ * Aura AI Routes — Chat (Claude) + Transcribe (OpenAI STT) + Conversations
  *
- * POST /ai/chat          — Send message to Sage AI, get response
+ * POST /ai/chat          — Send message to Aura AI, get response
  * POST /ai/transcribe    — Upload audio, get transcribed text
  * GET  /ai/conversations — List user's conversations
  * GET  /ai/conversations/:id — Get conversation by ID

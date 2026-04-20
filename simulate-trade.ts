@@ -1,7 +1,11 @@
 /**
  * simulate-trade.ts — Replicate the EXACT production flow from
- * seal-executor.ts → seal-session.ts → transaction-sender.ts
+ * bot-keypair-executor.ts → transaction-sender.ts
  * to find the real error when opening a trade.
+ *
+ * NOTE: This file references the legacy Seal wallet infrastructure
+ * (SealSession, seal-executor, SEAL_PROGRAM_ID) which is no longer
+ * the active architecture. Kept for historical debugging reference.
  *
  * Uses real bot from the database, real on-chain accounts.
  */
@@ -18,9 +22,9 @@ import config from "./src/config.js";
 import { deriveWalletPda, deriveAgentPda, deriveSessionPda, SEAL_PROGRAM_ID } from "./src/services/solana.js";
 import { SealSession } from "./src/engine/seal-session.js";
 
-// ── Exactly replicate seal-executor's rewriteDelegatedIx ──
+// ── Exactly replicate legacy seal-executor's rewriteDelegatedIx ──
 const DLMM_PROGRAM_ID = new PublicKey("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo");
-// Use the EXACT same discriminators as production seal-executor.ts
+// Use the EXACT same discriminators as the legacy seal-executor.ts
 const DLMM_INITIALIZE_POSITION_DISC = Buffer.from([219, 192, 234, 71, 190, 191, 102, 80]);
 const DLMM_INITIALIZE_BIN_ARRAY_DISC = Buffer.from([35, 86, 19, 185, 78, 212, 75, 211]);
 
@@ -74,7 +78,7 @@ async function simulate() {
     const [user] = await db.select().from(users).where(eq(users.id, botRow.userId));
     if (!user?.walletAddress) { console.log("No user wallet"); process.exit(1); }
 
-    // ── 2. Build SealSession (exactly like orchestrator.ts) ──
+    // ── 2. Build legacy SealSession (exactly like orchestrator.ts) ──
     const ownerPubkey = new PublicKey(user.walletAddress);
     const [walletPda] = deriveWalletPda(ownerPubkey);
     const sealSession = SealSession.fromDb(
@@ -124,7 +128,7 @@ async function simulate() {
     if (!pool) { console.log("No eligible pool found"); process.exit(1); }
     console.log(`Pool: ${pool.name} (${pool.address})`);
 
-    // ── 4. Build DLMM TX (exactly like seal-executor.ts) ──
+    // ── 4. Build DLMM TX (exactly like legacy seal-executor.ts) ──
     console.log("\nBuilding DLMM TX...");
     const dlmm = await DLMM.create(connection, new PublicKey(pool.address));
     const activeBin = await dlmm.getActiveBin();
@@ -213,8 +217,8 @@ async function simulate() {
         });
     }
 
-    // ── 6. Wrap in executeViaSession (exactly like seal-session.ts wrapTransaction) ──
-    console.log("\nWrapping in executeViaSession...");
+    // ── 6. Wrap in executeViaSession (legacy seal-session.ts wrapTransaction) ──
+    console.log("\nWrapping in executeViaSession (legacy Seal flow)...");
     const amountLamportsBig = BigInt(testAmountLamports);
     let wrappedTx: Transaction;
     try {
@@ -239,7 +243,7 @@ async function simulate() {
     wrappedTx.instructions.forEach((ix, i) => {
         const prog = ix.programId.toBase58();
         const label = prog === CB ? "ComputeBudget" :
-            prog === SEAL_PROGRAM_ID.toBase58() ? "Seal::executeViaSession" :
+            prog === SEAL_PROGRAM_ID.toBase58() ? "Legacy Seal::executeViaSession" :
                 prog.slice(0, 15) + "...";
         console.log(`  [${i}] ${label} (${ix.keys.length} keys, ${ix.data.length} bytes)`);
     });

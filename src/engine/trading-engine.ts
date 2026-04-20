@@ -9,6 +9,7 @@
  */
 
 import BN from "bn.js";
+import crypto from "node:crypto";
 import type {
   BotConfig,
   ITradingExecutor,
@@ -80,6 +81,22 @@ export interface EngineStats {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// Scan Decision (per-pool record for Decision Log — audit §6.2)
+// ═══════════════════════════════════════════════════════════════
+
+export interface ScanDecision {
+  poolAddress: string;
+  poolName: string;
+  decision: "entered" | "watched" | "skipped";
+  reason: string;
+  ruleScore?: number;
+  mlProbability?: number;
+  scoreBreakdown?: MarketScore;
+  features?: V3Features;
+  positionId?: string;
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Lifecycle callback — used by BotOrchestrator
 // ═══════════════════════════════════════════════════════════════
 
@@ -87,7 +104,7 @@ export type EngineEvent =
   | { type: "position:opened"; position: TrackedPosition; score: MarketScore }
   | { type: "position:closed"; position: TrackedPosition; pnlLamports: BN }
   | { type: "position:updated"; position: TrackedPosition }
-  | { type: "scan:completed"; eligible: number; entered: number }
+  | { type: "scan:completed"; eligible: number; entered: number; scanId: string; decisions: ScanDecision[] }
   | { type: "engine:started" }
   | { type: "engine:stopped"; stats: EngineStats }
   | { type: "engine:error"; error: string }
@@ -374,23 +391,53 @@ export class TradingEngine {
       const slotsAvailable =
         effectiveMaxPositions - activePositions.length;
 
-      let topPools: { pool: MeteoraPairData; score: MarketScore; mlPrediction?: MLPrediction; mlFeatures?: V3Features }[] = [];
+      const scanId = crypto.randomUUID();
+      const decisions: ScanDecision[] = [];
 
-      if (strategyMode === "sage-ai") {
+      // Collect decisions for pools removed by cooldown/active-position filters
+      for (const pool of eligiblePools) {
+        const cooldown = this.cooldowns.get(pool.address);
+        if (cooldown) {
+          const minutesSinceExit = (Date.now() - cooldown.exitTimestamp) / (1000 * 60);
+          if (minutesSinceExit < this.config.cooldownMinutes) {
+            decisions.push({
+              poolAddress: pool.address,
+              poolName: pool.name,
+              decision: "skipped",
+              reason: `Cooldown (${Math.round(this.config.cooldownMinutes - minutesSinceExit)}m remaining)`,
+            });
+          }
+        }
+        if (activePoolAddresses.has(pool.address)) {
+          decisions.push({
+            poolAddress: pool.address,
+            poolName: pool.name,
+            decision: "skipped",
+            reason: "Active position already open",
+          });
+        }
+      }
+
+      let topPools: { pool: MeteoraPairData; score: MarketScore; mlPrediction?: MLPrediction; mlFeatures?: V3Features }[] = [];
+      let allScored: { pool: MeteoraPairData; score: MarketScore; mlPrediction?: MLPrediction; mlFeatures?: V3Features }[] = [];
+
+      if (strategyMode === "aura-ai") {
         if (!this.mlPredictor?.isEnabled) {
           log.error(
             { label: this.label },
-            "sage-ai mode requires ML model but predictor is not available. " +
+            "aura-ai mode requires ML model but predictor is not available. " +
             "Bot will not enter positions until model is loaded."
           );
           this.onEvent({
             type: "engine:error",
-            error: "ML model unavailable — sage-ai mode cannot operate without it. " +
+            error: "ML model unavailable — aura-ai mode cannot operate without it. " +
               "Switch to rule-based or ensure model file is deployed.",
           });
           return;
         }
-        topPools = await this.scoreWithML(availablePools, slotsAvailable);
+        const result = await this.scoreWithMLFull(availablePools, slotsAvailable);
+        topPools = result.qualifying;
+        allScored = result.all;
       } else if (strategyMode === "both") {
         if (!this.mlPredictor?.isEnabled) {
           log.warn(
@@ -402,16 +449,64 @@ export class TradingEngine {
             message: "ML model unavailable — using rule-based scoring only",
           });
         }
-        topPools = await this.scoreHybrid(availablePools, slotsAvailable);
+        const result = await this.scoreHybridFull(availablePools, slotsAvailable);
+        topPools = result.qualifying;
+        allScored = result.all;
       } else {
         // ── Rule-based mode (original) ──
-        topPools = await this.scoreRuleBased(availablePools, slotsAvailable);
+        const result = await this.scoreRuleBasedFull(availablePools, slotsAvailable);
+        topPools = result.qualifying;
+        allScored = result.all;
+      }
+
+      // Build decisions from scored pools
+      const topPoolAddrs = new Set(topPools.map((p) => p.pool.address));
+      for (const { pool, score, mlPrediction, mlFeatures } of allScored) {
+        if (topPoolAddrs.has(pool.address)) continue; // will be handled after entry
+        const isWatched = score.totalScore >= this.config.entryScoreThreshold * 0.7;
+        decisions.push({
+          poolAddress: pool.address,
+          poolName: pool.name,
+          decision: isWatched ? "watched" : "skipped",
+          reason: this.buildSkipReason(score, mlPrediction, strategyMode),
+          ruleScore: score.totalScore,
+          mlProbability: mlPrediction?.probability,
+          scoreBreakdown: score,
+          features: mlFeatures,
+        });
       }
 
       let entered = 0;
       for (const { pool, score, mlPrediction, mlFeatures } of topPools) {
         const ok = await this.enterPosition(pool, score, mlPrediction, mlFeatures);
-        if (ok) entered++;
+        if (ok) {
+          entered++;
+          const newPos = this.executor
+            .getActivePositions()
+            .find((p) => p.poolAddress === pool.address);
+          decisions.push({
+            poolAddress: pool.address,
+            poolName: pool.name,
+            decision: "entered",
+            reason: "Passed all filters",
+            ruleScore: score.totalScore,
+            mlProbability: mlPrediction?.probability,
+            scoreBreakdown: score,
+            features: mlFeatures,
+            positionId: newPos?.id,
+          });
+        } else {
+          decisions.push({
+            poolAddress: pool.address,
+            poolName: pool.name,
+            decision: "skipped",
+            reason: "Entry failed (circuit breaker, balance, or tx error)",
+            ruleScore: score.totalScore,
+            mlProbability: mlPrediction?.probability,
+            scoreBreakdown: score,
+            features: mlFeatures,
+          });
+        }
         await sleep(500);
       }
 
@@ -419,6 +514,8 @@ export class TradingEngine {
         type: "scan:completed",
         eligible: eligiblePools.length,
         entered,
+        scanId,
+        decisions,
       });
     } catch (error) {
       const msg =
@@ -435,11 +532,12 @@ export class TradingEngine {
   /**
    * Rule-based scoring (original FreesolGames-style).
    * Filters by entryScoreThreshold, ranks by totalScore.
+   * Returns qualifying candidates AND all scored pools for decision logging.
    */
-  private async scoreRuleBased(
+  private async scoreRuleBasedFull(
     pools: MeteoraPairData[],
     slotsAvailable: number
-  ): Promise<{ pool: MeteoraPairData; score: MarketScore }[]> {
+  ): Promise<{ qualifying: { pool: MeteoraPairData; score: MarketScore; mlPrediction?: MLPrediction; mlFeatures?: V3Features }[]; all: { pool: MeteoraPairData; score: MarketScore; mlPrediction?: MLPrediction; mlFeatures?: V3Features }[] }> {
     // Score ALL eligible pools — pure arithmetic, no I/O, ~400 pools is trivial
     const scoredPools = await Promise.all(
       pools.map(async (pool) => {
@@ -483,19 +581,18 @@ export class TradingEngine {
       );
     }
 
-    return qualifying;
+    return { qualifying, all: scoredPools };
   }
 
   /**
    * Pure ML scoring — uses XGBoost probability as the sole entry criterion.
-   * Pools above the ML threshold get entered.
-   * Uses per-bot mlThreshold if set, otherwise falls back to the model's default (0.8845).
+   * Returns qualifying candidates AND all scored pools for decision logging.
    */
-  private async scoreWithML(
+  private async scoreWithMLFull(
     pools: MeteoraPairData[],
     slotsAvailable: number
-  ): Promise<{ pool: MeteoraPairData; score: MarketScore; mlPrediction?: MLPrediction; mlFeatures?: V3Features }[]> {
-    if (!this.mlPredictor) return [];
+  ): Promise<{ qualifying: { pool: MeteoraPairData; score: MarketScore; mlPrediction?: MLPrediction; mlFeatures?: V3Features }[]; all: { pool: MeteoraPairData; score: MarketScore; mlPrediction?: MLPrediction; mlFeatures?: V3Features }[] }> {
+    if (!this.mlPredictor) return { qualifying: [], all: [] };
 
     // Per-bot threshold override — allows tuning aggressiveness without retraining
     const mlThreshold = this.config.mlThreshold;
@@ -521,41 +618,45 @@ export class TradingEngine {
         { label: this.label },
         "ML prediction failed — skipping this scan cycle. " +
         "Ensure models/lp_predictor_v3_latest.json is present and valid. " +
-        "sage-ai mode will NOT fall back to rule-based."
+        "aura-ai mode will NOT fall back to rule-based."
       );
       // Surface the error to the user via bot status so they see it in the app
       this.onEvent({
         type: "engine:error",
         error: "ML model prediction failed. Check server logs for details.",
       });
-      return [];
+      return { qualifying: [], all: [] };
     }
 
-    // Combine with market scores and filter by ML probability
+    // Combine with market scores — score ALL pools, then filter
+    const allScored: { pool: MeteoraPairData; score: MarketScore; mlPrediction?: MLPrediction; mlFeatures?: V3Features }[] = [];
     const results: { pool: MeteoraPairData; score: MarketScore; mlPrediction?: MLPrediction; mlFeatures?: V3Features }[] = [];
 
     for (let i = 0; i < featureData.length; i++) {
       const pred = predictions[i];
-      // Use per-bot threshold if set, otherwise respect the model's built-in recommendation
-      const passes = mlThreshold != null
-        ? pred.probability >= mlThreshold
-        : pred.recommendation === "enter";
-      if (!passes) continue;
-
       const score = await this.marketData.calculateMarketScore(featureData[i].pool);
-      results.push({
+      const entry = {
         pool: featureData[i].pool,
         score,
         mlPrediction: pred,
         mlFeatures: featureData[i].features,
-      });
+      };
+      allScored.push(entry);
+
+      // Use per-bot threshold if set, otherwise respect the model's built-in recommendation
+      const passes = mlThreshold != null
+        ? pred.probability >= mlThreshold
+        : pred.recommendation === "enter";
+      if (passes) {
+        results.push(entry);
+      }
     }
 
     if (results.length > 0) {
       log.info(
         {
           label: this.label,
-          mode: "sage-ai",
+          mode: "aura-ai",
           candidates: results.length,
           threshold: mlThreshold ?? "model-default",
           topProb: results[0]?.mlPrediction?.probability,
@@ -570,7 +671,7 @@ export class TradingEngine {
       log.debug(
         {
           label: this.label,
-          mode: "sage-ai",
+          mode: "aura-ai",
           threshold: mlThreshold ?? "model-default",
           poolsEvaluated: predictions.length,
           bestProbs: topPreds.map((p) => ({
@@ -583,21 +684,23 @@ export class TradingEngine {
     }
 
     // Rank by ML probability (highest first)
-    return results
+    const qualifying = results
       .sort((a, b) => (b.mlPrediction?.probability ?? 0) - (a.mlPrediction?.probability ?? 0))
       .slice(0, slotsAvailable);
+    return { qualifying, all: allScored };
   }
 
   /**
    * Hybrid scoring — rule-based filter + ML re-ranking.
-   * First filters by entryScoreThreshold, then re-ranks by ML probability.
-   * Only enters pools where BOTH rule-based AND ML agree.
+   * Returns qualifying candidates AND all scored pools for decision logging.
    */
-  private async scoreHybrid(
+  private async scoreHybridFull(
     pools: MeteoraPairData[],
     slotsAvailable: number
-  ): Promise<{ pool: MeteoraPairData; score: MarketScore; mlPrediction?: MLPrediction; mlFeatures?: V3Features }[]> {
-    if (!this.mlPredictor) return this.scoreRuleBased(pools, slotsAvailable);
+  ): Promise<{ qualifying: { pool: MeteoraPairData; score: MarketScore; mlPrediction?: MLPrediction; mlFeatures?: V3Features }[]; all: { pool: MeteoraPairData; score: MarketScore; mlPrediction?: MLPrediction; mlFeatures?: V3Features }[] }> {
+    if (!this.mlPredictor) {
+      return this.scoreRuleBasedFull(pools, slotsAvailable);
+    }
 
     // Step 1: Score ALL eligible pools — pure arithmetic, no I/O
     const scoredPools = await Promise.all(
@@ -633,7 +736,7 @@ export class TradingEngine {
         },
         "No rule-based candidates for ML re-ranking"
       );
-      return [];
+      return { qualifying: [], all: scoredPools };
     }
 
     log.info(
@@ -670,7 +773,7 @@ export class TradingEngine {
         type: "engine:warning",
         message: "ML prediction failed this cycle — entered via rule-based scores only",
       });
-      return candidates.slice(0, slotsAvailable);
+      return { qualifying: candidates.slice(0, slotsAvailable), all: scoredPools };
     }
 
     // Step 3: Only enter where BOTH agree
@@ -708,7 +811,26 @@ export class TradingEngine {
       "Hybrid scoring complete"
     );
 
-    return final;
+    return { qualifying: final, all: scoredPools };
+  }
+
+  // ── Decision Reason Builder ──
+
+  private buildSkipReason(
+    score: MarketScore,
+    mlPrediction: MLPrediction | undefined,
+    strategyMode: string
+  ): string {
+    if (strategyMode === "aura-ai" && mlPrediction) {
+      return `ML probability ${mlPrediction.probability.toFixed(4)} below threshold`;
+    }
+    if (strategyMode === "both" && mlPrediction) {
+      if (score.totalScore < this.config.entryScoreThreshold) {
+        return `Score ${score.totalScore.toFixed(0)} < threshold ${this.config.entryScoreThreshold}`;
+      }
+      return `ML rejected (prob ${mlPrediction.probability.toFixed(4)})`;
+    }
+    return `Score ${score.totalScore.toFixed(0)} < threshold ${this.config.entryScoreThreshold}`;
   }
 
   // ── Enter Position ──
@@ -823,6 +945,15 @@ export class TradingEngine {
         { pool: pool.name, error: result.error },
         "Failed to open position"
       );
+
+      // Sim permanently rejects pools where mint_y !== WSOL. Put them on a
+      // far-future cooldown so they are never re-picked this session.
+      if (result.error?.startsWith("SIM_NON_SOL_QUOTE")) {
+        this.cooldowns.set(pool.address, {
+          poolAddress: pool.address,
+          exitTimestamp: Date.now() + 365 * 24 * 60 * 60 * 1000,
+        });
+      }
 
       // ── FATAL: insufficient balance → stop engine immediately ──
       // Don't keep scanning if the wallet can't fund any positions.

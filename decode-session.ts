@@ -1,6 +1,6 @@
 /**
  * Decode the on-chain SessionKey PDA data with the CORRECT layout
- * from seal/programs/seal-wallet/src/state/session_key.rs
+ * from the legacy Seal wallet program (no longer active architecture)
  */
 import { Connection, PublicKey } from "@solana/web3.js";
 

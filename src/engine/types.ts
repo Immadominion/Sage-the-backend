@@ -3,7 +3,7 @@
  *
  * These are the core types used by the TradingEngine, executors,
  * and market data providers.  Kept in sync with lp-bot but decoupled
- * so sage-backend can evolve independently.
+ * so aura-backend can evolve independently.
  */
 
 import { PublicKey, Keypair } from "@solana/web3.js";
@@ -266,7 +266,7 @@ export interface MarketScore {
 // Bot Configuration
 // ═══════════════════════════════════════════════════════════════
 
-export type StrategyMode = "rule-based" | "sage-ai" | "both";
+export type StrategyMode = "rule-based" | "aura-ai" | "both";
 
 export interface BotConfig {
   mode: ExecutionMode;
@@ -286,6 +286,7 @@ export interface BotConfig {
 
   // Token filtering
   solPairsOnly: boolean;
+  requireSolQuote?: boolean; // Pre-filter: only pools where mint_y === WSOL
   blacklist: string[];
 
   // Position sizing

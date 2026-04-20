@@ -1,5 +1,5 @@
 /**
- * Sage Backend — Database schema (Drizzle ORM + PostgreSQL)
+ * Aura Backend — Database schema (Drizzle ORM + PostgreSQL)
  *
  * Tables:
  *  - users: wallet-authenticated users
@@ -98,9 +98,9 @@ export const bots = pgTable(
     })
       .notNull()
       .default("stopped"),
-    /** Strategy type: rule-based, sage-ai, or both */
+    /** Strategy type: rule-based, aura-ai, or both */
     strategyMode: text("strategy_mode", {
-      enum: ["rule-based", "sage-ai", "both"],
+      enum: ["rule-based", "aura-ai", "both"],
     })
       .notNull()
       .default("rule-based"),
@@ -109,7 +109,7 @@ export const bots = pgTable(
     entryScoreThreshold: doublePrecision("entry_score_threshold")
       .notNull()
       .default(150),
-    /** ML probability threshold override for sage-ai mode (0-1). Null = use model default. */
+    /** ML probability threshold override for aura-ai mode (0-1). Null = use model default. */
     mlThreshold: doublePrecision("ml_threshold"),
     minVolume24h: doublePrecision("min_volume_24h").notNull().default(1000),
     minLiquidity: doublePrecision("min_liquidity").notNull().default(100),
@@ -423,5 +423,80 @@ export const conversations = pgTable(
     uniqueIndex("conversations_conversation_id_idx").on(table.conversationId),
     index("conversations_user_id_idx").on(table.userId),
     index("conversations_type_idx").on(table.type),
+  ]
+);
+
+// ═══════════════════════════════════════════════════════════════
+// Bot Decisions (per-pool scan decisions — audit §6.2)
+// ═══════════════════════════════════════════════════════════════
+
+export const botDecisions = pgTable(
+  "bot_decisions",
+  {
+    id: serial("id").primaryKey(),
+    botId: text("bot_id")
+      .notNull()
+      .references(() => bots.botId),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id),
+    /** Groups all decisions from the same scan cycle */
+    scanId: text("scan_id").notNull(),
+    poolAddress: text("pool_address").notNull(),
+    poolName: text("pool_name").notNull(),
+    /** What happened */
+    decision: text("decision", {
+      enum: ["entered", "watched", "skipped"],
+    }).notNull(),
+    /** Human-readable reason for the decision */
+    reason: text("reason").notNull(),
+    /** Rule-based total score */
+    ruleScore: doublePrecision("rule_score"),
+    /** ML probability (0-1) if available */
+    mlProbability: doublePrecision("ml_probability"),
+    /** Full MarketScore breakdown (JSON) */
+    scoreBreakdown: jsonb("score_breakdown"),
+    /** V3 ML feature snapshot (JSON) */
+    features: jsonb("features"),
+    /** Linked position ID when decision = 'entered' */
+    positionId: text("position_id"),
+    timestamp: timestamp("timestamp", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    index("bot_decisions_bot_id_idx").on(table.botId),
+    index("bot_decisions_user_id_idx").on(table.userId),
+    index("bot_decisions_scan_id_idx").on(table.scanId),
+    index("bot_decisions_position_id_idx").on(table.positionId),
+    index("bot_decisions_timestamp_idx").on(table.timestamp),
+  ]
+);
+
+// ═══════════════════════════════════════════════════════════════
+// Device Tokens (FCM push notifications)
+// ═══════════════════════════════════════════════════════════════
+
+export const deviceTokens = pgTable(
+  "device_tokens",
+  {
+    id: serial("id").primaryKey(),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    /** FCM registration token */
+    token: text("token").notNull(),
+    /** Device platform: ios | android */
+    platform: text("platform").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    index("device_tokens_user_id_idx").on(table.userId),
+    uniqueIndex("device_tokens_token_idx").on(table.token),
   ]
 );
