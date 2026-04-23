@@ -100,12 +100,19 @@ wallet.get("/address/:botId", requireAuth, async (c) => {
 
 // ═══════════════════════════════════════════════════════════════
 // POST /wallet/withdraw/:botId
-// Withdraw SOL from bot wallet → owner wallet.
-// Backend decrypts the keypair and signs the transfer.
+// Withdraw SOL from bot wallet → bot.ownerWallet (the SIWS-authenticated
+// wallet that registered the bot).
+//
+// Security (H2): the backend signs the transfer with the bot's keypair,
+// so we MUST NOT let a caller redirect funds. `destination` is accepted
+// for API compatibility but is required to equal `bot.ownerWallet` —
+// any mismatch is rejected. To withdraw elsewhere, send to the owner
+// wallet first and forward from there using a real wallet signature.
 // ═══════════════════════════════════════════════════════════════
 
 const withdrawSchema = z.object({
   amountSOL: z.number().positive().max(10_000),
+  /** Optional — if supplied, MUST equal bot.ownerWallet. Backend never honours an arbitrary value. */
   destination: z.string().min(32).max(50).optional(),
 });
 
@@ -121,20 +128,29 @@ wallet.post(
     const bot = await getLiveBot(userId, botId);
     const { amountSOL, destination } = c.req.valid("json");
 
-    if (!bot.ownerWallet && !destination) {
+    if (!bot.ownerWallet) {
       throw createApiError(
         "Owner wallet not set — cannot withdraw. Contact support.",
         400
       );
     }
 
-    // Validate destination if provided
-    const destinationAddress = destination ?? bot.ownerWallet!;
+    // If the caller specified a destination, it must equal the bot's
+    // owner wallet — otherwise we'd be letting whoever holds the access
+    // token drain funds anywhere.
+    if (destination && destination !== bot.ownerWallet) {
+      throw createApiError(
+        "Withdrawals are only allowed to the bot's registered owner wallet",
+        403
+      );
+    }
+
+    const destinationAddress = bot.ownerWallet;
     let destinationPubkey: PublicKey;
     try {
       destinationPubkey = new PublicKey(destinationAddress);
     } catch {
-      throw createApiError("Invalid destination wallet address", 400);
+      throw createApiError("Invalid owner wallet address on record", 500);
     }
 
     const connection = getConnection();

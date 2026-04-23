@@ -28,6 +28,30 @@ const ai = new Hono<{ Variables: AuthVariables }>();
 // All AI routes require authentication
 ai.use("*", requireAuth);
 
+// ─── Per-user daily AI usage caps (H6) ───
+// Coarse abuse limit on top of the IP-based rate limiter. Resets at UTC midnight.
+const MAX_CHAT_PER_DAY = 200;
+const MAX_TRANSCRIBE_PER_DAY = 100;
+type UsageEntry = { day: string; chat: number; transcribe: number };
+const aiUsage = new Map<number, UsageEntry>();
+
+function utcDayKey(): string {
+    return new Date().toISOString().slice(0, 10);
+}
+
+function checkAndIncrement(userId: number, kind: "chat" | "transcribe"): boolean {
+    const today = utcDayKey();
+    let entry = aiUsage.get(userId);
+    if (!entry || entry.day !== today) {
+        entry = { day: today, chat: 0, transcribe: 0 };
+        aiUsage.set(userId, entry);
+    }
+    const limit = kind === "chat" ? MAX_CHAT_PER_DAY : MAX_TRANSCRIBE_PER_DAY;
+    if (entry[kind] >= limit) return false;
+    entry[kind] += 1;
+    return true;
+}
+
 // ═══════════════════════════════════════════════════════════════
 // POST /ai/chat — Send message to Sage AI
 // ═══════════════════════════════════════════════════════════════
@@ -59,6 +83,13 @@ ai.post("/chat", zValidator("json", chatSchema), async (c) => {
 
     if (!aiService.isLlmAvailable) {
         return c.json({ error: "AI_UNAVAILABLE", message: "AI service is not configured" }, 503);
+    }
+
+    if (!checkAndIncrement(userId, "chat")) {
+        return c.json(
+            { error: "DAILY_LIMIT_REACHED", message: "Daily AI chat limit reached. Try again tomorrow." },
+            429
+        );
     }
 
     try {
@@ -169,6 +200,14 @@ ai.post("/transcribe", async (c) => {
         );
     }
 
+    const userId = c.get("userId");
+    if (!checkAndIncrement(userId, "transcribe")) {
+        return c.json(
+            { error: "DAILY_LIMIT_REACHED", message: "Daily transcription limit reached. Try again tomorrow." },
+            429
+        );
+    }
+
     try {
         const body = await c.req.parseBody();
         const audioFile = body["audio"];
@@ -184,6 +223,33 @@ ai.post("/transcribe", async (c) => {
         if (audioFile.size > 25 * 1024 * 1024) {
             return c.json(
                 { error: "FILE_TOO_LARGE", message: "Audio file must be under 25MB" },
+                400
+            );
+        }
+
+        // MIME allowlist — keep aligned with OpenAI Whisper supported formats.
+        // Reject anything else up front so we never feed arbitrary binaries
+        // to the upstream API.
+        const ALLOWED_AUDIO_MIME = new Set([
+            "audio/mpeg",
+            "audio/mp3",
+            "audio/mp4",
+            "audio/m4a",
+            "audio/x-m4a",
+            "audio/mpga",
+            "audio/wav",
+            "audio/x-wav",
+            "audio/wave",
+            "audio/webm",
+            "audio/ogg",
+            "audio/flac",
+        ]);
+        if (!audioFile.type || !ALLOWED_AUDIO_MIME.has(audioFile.type)) {
+            return c.json(
+                {
+                    error: "UNSUPPORTED_AUDIO_TYPE",
+                    message: `Unsupported audio MIME type${audioFile.type ? `: ${audioFile.type}` : ""}`,
+                },
                 400
             );
         }

@@ -97,3 +97,43 @@ export function generateEncryptedKeypair(masterKeyHex: string): {
         encryptedSecret,
     };
 }
+
+/**
+ * Encrypt an arbitrary UTF-8 string (e.g. an API key) with AES-256-GCM.
+ * Returns the same base64 iv:tag:ciphertext format as encryptKeypair.
+ */
+export function encryptString(plaintext: string, masterKeyHex: string): string {
+    const key = deriveKey(masterKeyHex);
+    const iv = randomBytes(IV_LENGTH);
+    const cipher = createCipheriv(ALGORITHM, key, iv);
+
+    const encrypted = Buffer.concat([
+        cipher.update(Buffer.from(plaintext, "utf8")),
+        cipher.final(),
+    ]);
+    const tag = cipher.getAuthTag();
+
+    return Buffer.concat([iv, tag, encrypted]).toString("base64");
+}
+
+/**
+ * Decrypt a base64-encoded AES-256-GCM ciphertext back to a UTF-8 string.
+ * Throws on tampered data or wrong key.
+ */
+export function decryptString(encryptedBase64: string, masterKeyHex: string): string {
+    const key = deriveKey(masterKeyHex);
+    const packed = Buffer.from(encryptedBase64, "base64");
+
+    if (packed.length < IV_LENGTH + TAG_LENGTH + 1) {
+        throw new Error("Invalid encrypted string: too short");
+    }
+
+    const iv = packed.subarray(0, IV_LENGTH);
+    const tag = packed.subarray(IV_LENGTH, IV_LENGTH + TAG_LENGTH);
+    const ciphertext = packed.subarray(IV_LENGTH + TAG_LENGTH);
+
+    const decipher = createDecipheriv(ALGORITHM, key, iv);
+    decipher.setAuthTag(tag);
+
+    return Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString("utf8");
+}

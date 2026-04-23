@@ -28,6 +28,8 @@ import {
     Keypair,
     VersionedTransaction,
     LAMPORTS_PER_SOL,
+    SystemProgram,
+    Transaction,
 } from "@solana/web3.js";
 import {
     getAssociatedTokenAddress,
@@ -138,7 +140,10 @@ export class BotKeypairExecutor implements ITradingExecutor {
         poolAddress: string,
         strategy: StrategyParameters,
         amountX: BN,
-        amountY: BN
+        amountY: BN,
+        options?: {
+            maxHoldTimeMinutes?: number;
+        }
     ): Promise<OpenPositionResult> {
         const eCheck = this.emergencyStop.canTrade();
         if (!eCheck.allowed) {
@@ -274,7 +279,8 @@ export class BotKeypairExecutor implements ITradingExecutor {
                 feesEarnedY: new BN(0),
                 profitTargetPercent: this.config.profitTargetPercent,
                 stopLossPercent: this.config.stopLossPercent,
-                maxHoldTimeMinutes: this.config.maxHoldTimeMinutes,
+                maxHoldTimeMinutes:
+                    options?.maxHoldTimeMinutes ?? this.config.maxHoldTimeMinutes,
                 trailingStopEnabled: this.config.trailingStopEnabled,
                 trailingStopPercent: this.config.trailingStopPercent,
                 highWaterMarkPercent: 0,
@@ -589,6 +595,80 @@ export class BotKeypairExecutor implements ITradingExecutor {
 
     getPublicKey(): PublicKey {
         return this.keypair.publicKey;
+    }
+
+    /**
+     * Charge a platform fee from the bot's wallet.
+     *
+     * Sends a SystemProgram.transfer of `feeLamports` from the bot keypair
+     * to `collectorWallet`, signed with this bot's keypair, with priority
+     * fee + retry policy via TransactionSender.
+     *
+     * Returns success=false if the bot can't afford the fee. The caller
+     * (TradingEngine.enterPosition) treats this as a soft failure — the
+     * fee is skipped and a ledger row is written with a null tx signature.
+     */
+    async chargeFee(
+        feeLamports: number,
+        collectorWallet: string
+    ): Promise<{ success: boolean; txSignature: string | null; error?: string }> {
+        if (feeLamports <= 0) {
+            return { success: true, txSignature: null };
+        }
+
+        // Validate destination
+        let collector: PublicKey;
+        try {
+            collector = new PublicKey(collectorWallet);
+        } catch {
+            return {
+                success: false,
+                txSignature: null,
+                error: `Invalid collector wallet address: ${collectorWallet}`,
+            };
+        }
+
+        // Don't drain the wallet — keep at least RENT_BUFFER for the next trade
+        const RENT_BUFFER = 25_000_000; // 0.025 SOL
+        const balance = await this.connection.getBalance(this.keypair.publicKey);
+        if (balance < feeLamports + RENT_BUFFER) {
+            return {
+                success: false,
+                txSignature: null,
+                error: `Insufficient balance for fee. Have ${balance}, need ${feeLamports + RENT_BUFFER} (fee + rent buffer)`,
+            };
+        }
+
+        try {
+            const tx = new Transaction().add(
+                SystemProgram.transfer({
+                    fromPubkey: this.keypair.publicKey,
+                    toPubkey: collector,
+                    lamports: feeLamports,
+                })
+            );
+            const txWithFees = this.txSender.addPriorityFee(tx);
+            const result = await this.txSender.sendTransaction(txWithFees, [
+                this.keypair,
+            ]);
+            if (!result.success) {
+                return {
+                    success: false,
+                    txSignature: null,
+                    error: result.error ?? "Fee transfer failed",
+                };
+            }
+            return {
+                success: true,
+                txSignature: result.signature ?? null,
+            };
+        } catch (err) {
+            return {
+                success: false,
+                txSignature: null,
+                error: err instanceof Error ? err.message : String(err),
+            };
+        }
     }
 
     getPerformanceSummary(): {

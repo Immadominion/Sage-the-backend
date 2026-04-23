@@ -22,7 +22,8 @@ import { logger as honoLogger } from "hono/logger";
 import config from "./config.js";
 import { errorHandler } from "./middleware/error.js";
 import { logger } from "./middleware/logger.js";
-import { globalRateLimit, authRateLimit, botLifecycleRateLimit, readRateLimit, mlRateLimit } from "./middleware/rate-limit.js";
+import { globalRateLimit, authRateLimit, botLifecycleRateLimit, readRateLimit, mlRateLimit, externalApiRateLimit } from "./middleware/rate-limit.js";
+import { requireAdmin } from "./middleware/admin.js";
 
 // Routes
 import healthRoutes from "./routes/health.js";
@@ -36,10 +37,15 @@ import positionRoutes from "./routes/position.js";
 import aiRoutes from "./routes/ai.js";
 import fleetRoutes from "./routes/fleet.js";
 import analyticsRoutes from "./routes/analytics.js";
+import lpAgentRoutes from "./routes/lp-agent.js";
 
 // Engine
 import { orchestrator } from "./engine/orchestrator.js";
 import { closeDatabase, runMigrations } from "./db/index.js";
+
+// Notifications
+import { startNotificationDispatcher } from "./services/notification-dispatcher.js";
+import { startDigestCron, stopDigestCron } from "./services/digest.js";
 
 // ═══════════════════════════════════════════════════════════════
 // App
@@ -54,12 +60,34 @@ app.use("*", requestId());
 app.use("*", secureHeaders());
 
 // ── Security: CORS — locked to configured origins ──
-const corsOrigins = config.CORS_ORIGINS === "*"
-  ? (config.NODE_ENV === "production" ? [] : "*" as const)
-  : config.CORS_ORIGINS.split(",").map(s => s.trim());
+// Production startup gate (config.ts) guarantees CORS_ORIGINS is never `*`
+// in production, so the wildcard branch only ever runs in dev.
+function parseCorsOrigins(raw: string): string | string[] {
+  if (raw === "*") return "*";
+  const list = raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+    .filter((s) => {
+      try {
+        // Round-trip through URL to normalise + reject malformed entries
+        const u = new URL(s);
+        return u.protocol === "https:" || (u.protocol === "http:" && u.hostname === "localhost");
+      } catch {
+        return false;
+      }
+    })
+    .map((s) => new URL(s).origin);
+  return list;
+}
 
-if (config.NODE_ENV === "production" && config.CORS_ORIGINS === "*") {
-  logger.warn("⚠️  CORS_ORIGINS is wildcard in production! Set explicit origins.");
+const corsOrigins = parseCorsOrigins(config.CORS_ORIGINS);
+
+if (config.NODE_ENV === "production" && corsOrigins === "*") {
+  // Defence-in-depth: config.ts hard-fails this case, but if env is mutated at runtime
+  // we refuse to wildcard CORS in production.
+  logger.error("CORS_ORIGINS resolved to wildcard in production — refusing to start");
+  process.exit(1);
 }
 
 logger.info(
@@ -104,7 +132,6 @@ app.use("/bot/create", botLifecycleRateLimit);
 app.use("/bot/*/start", botLifecycleRateLimit);
 app.use("/bot/*/stop", botLifecycleRateLimit);
 app.use("/bot/*/emergency", botLifecycleRateLimit);
-app.use("/ml/predict", mlRateLimit);
 app.use("/ml/reload", mlRateLimit);
 app.use("/position/*", readRateLimit);
 app.use("/ai/chat", mlRateLimit);
@@ -113,9 +140,14 @@ app.use("/ai/conversations", readRateLimit);
 app.use("/ai/conversations/*", readRateLimit);
 app.use("/ai/status", readRateLimit);
 app.use("/fleet/*", readRateLimit);
+// /analytics/* is admin-only (platform metrics, error logs, growth) — gated
+// behind ADMIN_TOKEN per the 2026-04-23 audit. The previous public exposure
+// leaked aggregate user/bot counts.
+app.use("/analytics/*", requireAdmin);
 app.use("/analytics/*", readRateLimit);
 app.use("/bot/list", readRateLimit);
 app.use("/wallet/*", readRateLimit);
+app.use("/lp-agent/*", externalApiRateLimit);
 
 // ── Routes ──
 app.route("/health", healthRoutes);
@@ -129,6 +161,7 @@ app.route("/position", positionRoutes);
 app.route("/ai", aiRoutes);
 app.route("/fleet", fleetRoutes);
 app.route("/analytics", analyticsRoutes);
+app.route("/lp-agent", lpAgentRoutes);
 
 // ── 404 ──
 app.notFound((c) => c.json({
@@ -179,8 +212,8 @@ const server = serve(
     logger.info("  GET  /strategy/presets");
     logger.info("  POST /strategy/create");
     logger.info("  GET  /ml/health");
-    logger.info("  POST /ml/predict");
-    logger.info("  POST /ml/reload");
+    logger.info("  POST /ml/reload  (admin)");
+    logger.info("  GET  /ml/feedback  (admin)");
     logger.info("  GET  /events/stream  (SSE)");
     logger.info("  GET  /position/active");
     logger.info("  GET  /position/history");
@@ -192,6 +225,15 @@ const server = serve(
     logger.info("  GET  /ai/conversations/:id");
     logger.info("  DELETE /ai/conversations/:id");
     logger.info("  GET  /ai/status");
+    logger.info("  GET  /lp-agent/status");
+    logger.info("  GET  /lp-agent/pools/discover");
+    logger.info("  GET  /lp-agent/pools/:poolId/info");
+    logger.info("  POST /lp-agent/pools/:poolId/add-tx");
+    logger.info("  POST /lp-agent/pools/landing-add-tx");
+    logger.info("  GET  /lp-agent/positions/opening");
+    logger.info("  POST /lp-agent/position/decrease-quotes");
+    logger.info("  POST /lp-agent/position/decrease-tx");
+    logger.info("  POST /lp-agent/position/landing-decrease-tx");
     logger.info("");
 
     // S2: Recover any bots that were running before server restart
@@ -202,6 +244,11 @@ const server = serve(
     }).catch((err) => {
       logger.error({ err: err instanceof Error ? err.message : String(err) }, "Bot recovery failed");
     });
+
+    // Push notifications: subscribe FCM dispatcher to bot lifecycle events,
+    // then schedule the daily PnL digest. Both are no-ops if FCM env unset.
+    startNotificationDispatcher();
+    startDigestCron();
   }
 );
 
@@ -239,6 +286,7 @@ const shutdown = async (signal: string) => {
 
   // Phase 2: Stop all running bots (waits for active trades to complete)
   try {
+    stopDigestCron();
     await orchestrator.stopAll();
     logger.info("All bots stopped cleanly");
   } catch (err) {

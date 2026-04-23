@@ -26,12 +26,41 @@ const events = new Hono<{ Variables: AuthVariables }>();
 // All event routes require authentication
 events.use("/*", requireAuth);
 
+// ─── Per-user concurrent stream cap ───
+// Each EventSource holds an open HTTP/1.1 connection; without this cap a
+// single compromised account can exhaust the upstream connection pool.
+const MAX_STREAMS_PER_USER = 5;
+const MAX_IDLE_MS = 30 * 60 * 1000; // 30 minutes
+const activeStreams = new Map<number, number>();
+
+function tryAcquireStreamSlot(userId: number): boolean {
+  const current = activeStreams.get(userId) ?? 0;
+  if (current >= MAX_STREAMS_PER_USER) return false;
+  activeStreams.set(userId, current + 1);
+  return true;
+}
+
+function releaseStreamSlot(userId: number): void {
+  const current = activeStreams.get(userId) ?? 0;
+  if (current <= 1) activeStreams.delete(userId);
+  else activeStreams.set(userId, current - 1);
+}
+
 // ═══════════════════════════════════════════════════════════════
 // SSE Stream — All bot events for the authenticated user
 // ═══════════════════════════════════════════════════════════════
 
 events.get("/stream", async (c) => {
   const userId = c.var.userId;
+
+  if (!tryAcquireStreamSlot(userId)) {
+    log.warn({ userId, cap: MAX_STREAMS_PER_USER }, "SSE stream cap reached");
+    return c.json(
+      { error: { message: "Too many concurrent event streams", statusCode: 429 } },
+      429
+    );
+  }
+
   log.info({ userId }, "SSE client connected");
 
   return streamSSE(c, async (stream) => {
@@ -76,12 +105,25 @@ events.get("/stream", async (c) => {
         });
     }, 30_000);
 
+    // Hard idle timeout — server-side cap so abandoned mobile streams
+    // do not pin a connection forever even if heartbeats keep flowing.
+    const idleTimer = setTimeout(() => {
+      log.info({ userId, maxIdleMs: MAX_IDLE_MS }, "SSE idle timeout reached");
+      stream.abort();
+    }, MAX_IDLE_MS);
+
     // Cleanup on disconnect
-    stream.onAbort(() => {
+    let cleanedUp = false;
+    const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
       log.info({ userId }, "SSE client disconnected");
       unsubscribe();
       clearInterval(heartbeat);
-    });
+      clearTimeout(idleTimer);
+      releaseStreamSlot(userId);
+    };
+    stream.onAbort(cleanup);
 
     // Keep the stream open indefinitely
     // The stream closes when the client disconnects (onAbort fires)

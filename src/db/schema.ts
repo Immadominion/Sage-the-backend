@@ -61,6 +61,12 @@ export const users = pgTable(
     authNonceExpiresAt: integer("auth_nonce_expires_at"),
     /** Refresh token hash (for token rotation) */
     refreshTokenHash: text("refresh_token_hash"),
+    /**
+     * Monotonically-increasing token generation. Bumped by /auth/logout to
+     * invalidate every previously-issued JWT. Access tokens carry this value
+     * in their payload; refresh-time check rejects mismatches.
+     */
+    tokenVersion: integer("token_version").notNull().default(0),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
@@ -98,9 +104,9 @@ export const bots = pgTable(
     })
       .notNull()
       .default("stopped"),
-    /** Strategy type: rule-based, aura-ai, or both */
+    /** Strategy type: rule-based, aura-ai, both, or llm */
     strategyMode: text("strategy_mode", {
-      enum: ["rule-based", "aura-ai", "both"],
+      enum: ["rule-based", "aura-ai", "both", "llm"],
     })
       .notNull()
       .default("rule-based"),
@@ -165,6 +171,10 @@ export const bots = pgTable(
     totalPnlLamports: bigint("total_pnl_lamports", { mode: "number" })
       .notNull()
       .default(0),
+    /** Cumulative platform fees paid by this bot (lamports). Append-only — never reset. */
+    totalFeesPaidLamports: bigint("total_fees_paid_lamports", { mode: "number" })
+      .notNull()
+      .default(0),
 
     /** Last error message if status=error */
     lastError: text("last_error"),
@@ -196,6 +206,20 @@ export const bots = pgTable(
      * Funds can ONLY be withdrawn to this address.
      */
     ownerWallet: text("owner_wallet"),
+
+    // ── LLM Mode (per-bot Anthropic key, encrypted at rest) ──
+    /**
+     * AES-256-GCM encrypted Anthropic API key.
+     * Only decrypted in-memory when strategyMode === "llm".
+     * Uses the same MASTER_ENCRYPTION_KEY as encryptedPrivateKey.
+     */
+    encryptedLlmApiKey: text("encrypted_llm_api_key"),
+    /** LLM model override. Null = claude-haiku-4-5-20251001 */
+    llmModel: text("llm_model"),
+    /** Hard daily USD spend cap for LLM API calls. Null = unlimited */
+    llmMaxUsdPerDay: doublePrecision("llm_max_usd_per_day"),
+    /** Max pools included in a single LLM prompt. Null = 10 */
+    llmMaxPoolsPerCall: integer("llm_max_pools_per_call"),
 
     // ── Soft Delete ──
     /** Null = active. Set = soft-deleted. Trade history preserved forever. */
@@ -498,5 +522,59 @@ export const deviceTokens = pgTable(
   (table) => [
     index("device_tokens_user_id_idx").on(table.userId),
     uniqueIndex("device_tokens_token_idx").on(table.token),
+  ]
+);
+
+// ═══════════════════════════════════════════════════════════════
+// Fee Ledger (per-trade platform fees)
+// ═══════════════════════════════════════════════════════════════
+//
+// Append-only audit log of every platform fee charged to a bot.
+// One row per position open. In live mode, txSignature points to the
+// SystemProgram.transfer that delivered the fee on-chain. In simulation
+// mode, txSignature is null (virtual deduction only).
+
+export const feeLedger = pgTable(
+  "fee_ledger",
+  {
+    id: serial("id").primaryKey(),
+    botId: text("bot_id")
+      .notNull()
+      .references(() => bots.botId),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id),
+    /** Linked position ID. Null if fee was charged but position open failed. */
+    positionId: text("position_id"),
+    /** Bot mode at the time the fee was charged */
+    mode: text("mode", { enum: ["simulation", "live"] }).notNull(),
+    /** Strategy mode at the time the fee was charged */
+    strategyMode: text("strategy_mode", {
+      enum: ["rule-based", "aura-ai", "both", "llm"],
+    }).notNull(),
+    /** Fee event type — currently only "entry"; "exit" reserved for future */
+    feeType: text("fee_type", { enum: ["entry", "exit"] })
+      .notNull()
+      .default("entry"),
+    /** Position size in lamports the fee was computed against */
+    positionSizeLamports: bigint("position_size_lamports", { mode: "number" })
+      .notNull(),
+    /** Total bps applied (base + surcharge) */
+    feeBps: integer("fee_bps").notNull(),
+    /** Lamports actually charged (post-clamp to min/max) */
+    feeLamports: bigint("fee_lamports", { mode: "number" }).notNull(),
+    /** Fee collector wallet at the time of charge — captured for audit */
+    collectorWallet: text("collector_wallet").notNull(),
+    /** Solana tx signature (live mode only). Null for simulation. */
+    txSignature: text("tx_signature"),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    index("fee_ledger_bot_id_idx").on(table.botId),
+    index("fee_ledger_user_id_idx").on(table.userId),
+    index("fee_ledger_position_id_idx").on(table.positionId),
+    index("fee_ledger_created_at_idx").on(table.createdAt),
   ]
 );

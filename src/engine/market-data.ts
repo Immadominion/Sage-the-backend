@@ -18,6 +18,7 @@ import type {
 import { SOL_MINT } from "./types.js";
 import { getSharedCache } from "./shared-cache.js";
 import { logger } from "../middleware/logger.js";
+import { lpAgentService } from "../services/lp-agent.js";
 
 const log = logger.child({ module: "market-data" });
 
@@ -28,6 +29,12 @@ const _require = createRequire(import.meta.url);
 const DLMM: any = _require("@meteora-ag/dlmm").default ?? _require("@meteora-ag/dlmm");
 
 export class MarketDataProvider implements IMarketDataProvider {
+  private static lpAgentCache: {
+    pools: MeteoraPairData[];
+    updatedAt: number;
+  } | null = null;
+  private static readonly LP_AGENT_CACHE_TTL_MS = 45_000;
+
   private connection: Connection;
   private config: BotConfig;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -42,6 +49,48 @@ export class MarketDataProvider implements IMarketDataProvider {
   }
 
   async fetchAllPools(): Promise<MeteoraPairData[]> {
+    // LP Agent can replace the direct discovery path when configured.
+    // Keep Meteora fallback for resiliency and parity during rollout.
+    if (lpAgentService.isConfigured) {
+      const now = Date.now();
+      const cached = MarketDataProvider.lpAgentCache;
+      if (cached && now - cached.updatedAt < MarketDataProvider.LP_AGENT_CACHE_TTL_MS) {
+        return cached.pools;
+      }
+
+      try {
+        const raw = await lpAgentService.discoverPools({
+          chain: "SOL",
+          page: 1,
+          pageSize: 50,
+          sortBy: "vol_24h",
+          sortOrder: "desc",
+        }) as {
+          data?: Array<Record<string, unknown>>;
+        };
+
+        const mapped = (raw.data ?? [])
+          .map((row) => this.mapLpAgentPool(row))
+          .filter((pool): pool is MeteoraPairData => pool !== null);
+
+        if (mapped.length > 0) {
+          MarketDataProvider.lpAgentCache = {
+            pools: mapped,
+            updatedAt: now,
+          };
+          log.debug({ count: mapped.length }, "Got pools from LP Agent cache/API");
+          return mapped;
+        }
+
+        log.warn("LP Agent returned no pool data — falling back to Meteora cache");
+      } catch (error) {
+        log.warn(
+          { err: error instanceof Error ? error.message : String(error) },
+          "LP Agent pool discovery failed — falling back to Meteora cache"
+        );
+      }
+    }
+
     try {
       const pools = await getSharedCache().getAllPools();
       log.debug({ count: pools.length }, "Got pools from shared cache");
@@ -53,6 +102,70 @@ export class MarketDataProvider implements IMarketDataProvider {
       );
       throw error;
     }
+  }
+
+  private mapLpAgentPool(row: Record<string, unknown>): MeteoraPairData | null {
+    const address = String(row.pool ?? "").trim();
+    if (!address) return null;
+
+    const token0Symbol = String(row.token0_symbol ?? "TOKEN0");
+    const token1Symbol = String(row.token1_symbol ?? "TOKEN1");
+    const token0Mint = String(row.token0 ?? "").trim();
+    const token1Mint = String(row.token1 ?? "").trim();
+
+    const vol1h = Number(row.vol_1h ?? 0);
+    const vol24h = Number(row.vol_24h ?? 0);
+    const tvl = Number(row.tvl ?? 0);
+    const feePct = Number(row.fee ?? 0);
+    const fee24h = vol24h * (feePct / 100);
+    const price = Number(row.quote_price ?? row.base_price ?? 0);
+
+    return {
+      address,
+      name: `${token0Symbol}-${token1Symbol}`,
+      mint_x: token0Mint,
+      mint_y: token1Mint,
+      reserve_x: "0",
+      reserve_y: "0",
+      reserve_x_amount: 0,
+      reserve_y_amount: 0,
+      bin_step: Number(row.bin_step ?? 1),
+      base_fee_percentage: String(feePct || 0),
+      max_fee_percentage: String(feePct || 0),
+      protocol_fee_percentage: "0",
+      liquidity: String(tvl || 0),
+      reward_mint_x: "",
+      reward_mint_y: "",
+      fees_24h: Number.isFinite(fee24h) ? fee24h : 0,
+      today_fees: Number.isFinite(fee24h) ? fee24h : 0,
+      trade_volume_24h: Number.isFinite(vol24h) ? vol24h : 0,
+      cumulative_trade_volume: "0",
+      cumulative_fee_volume: "0",
+      current_price: Number.isFinite(price) ? price : 0,
+      apr: 0,
+      apy: 0,
+      farm_apr: 0,
+      farm_apy: 0,
+      hide: false,
+      is_blacklisted: false,
+      fees: {
+        min_30: 0,
+        hour_1: 0,
+        hour_2: 0,
+        hour_4: 0,
+        hour_12: 0,
+        hour_24: Number.isFinite(fee24h) ? fee24h : 0,
+      },
+      volume: {
+        min_30: 0,
+        hour_1: Number.isFinite(vol1h) ? vol1h : 0,
+        hour_2: 0,
+        hour_4: 0,
+        hour_12: 0,
+        hour_24: Number.isFinite(vol24h) ? vol24h : 0,
+      },
+      is_verified: true,
+    };
   }
 
   async getPoolData(poolAddress: string): Promise<MeteoraPairData | null> {

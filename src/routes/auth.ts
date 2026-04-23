@@ -15,6 +15,7 @@ import {
   verifySIWSSignature,
   issueTokens,
   refreshTokens,
+  revokeAllTokens,
   buildSIWSMessage,
 } from "../services/auth.js";
 import { requireAuth, type AuthVariables } from "../middleware/auth.js";
@@ -145,6 +146,23 @@ auth.post("/refresh", zValidator("json", refreshSchema), async (c) => {
       401
     );
   }
+});
+
+/**
+ * POST /auth/logout
+ * Revoke every outstanding session for the authenticated user.
+ *
+ * Bumps `tokenVersion` (so any non-expired access tokens fail the next
+ * refresh check) and clears the stored refresh-token hash (so the in-flight
+ * refresh chain dies immediately). The current access token will keep
+ * working until its short TTL expires \u2014 that's the trade-off vs. a per-call
+ * DB lookup. If you want hard kill on every API call, add a tokenVersion
+ * cache check inside requireAuth().
+ */
+auth.post("/logout", requireAuth, async (c) => {
+  const userId = c.var.userId;
+  await revokeAllTokens(userId);
+  return c.json({ success: true });
 });
 
 /**

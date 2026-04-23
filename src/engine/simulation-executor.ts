@@ -74,7 +74,10 @@ export class SimulationExecutor implements ITradingExecutor {
     poolAddress: string,
     strategy: StrategyParameters,
     amountX: BN,
-    amountY: BN
+    amountY: BN,
+    options?: {
+      maxHoldTimeMinutes?: number;
+    }
   ): Promise<OpenPositionResult> {
     try {
       const totalAmount = amountX.add(amountY);
@@ -165,7 +168,8 @@ export class SimulationExecutor implements ITradingExecutor {
 
         profitTargetPercent: this.config.profitTargetPercent,
         stopLossPercent: this.config.stopLossPercent,
-        maxHoldTimeMinutes: this.config.maxHoldTimeMinutes,
+        maxHoldTimeMinutes:
+          options?.maxHoldTimeMinutes ?? this.config.maxHoldTimeMinutes,
 
         trailingStopEnabled: this.config.trailingStopEnabled ?? false,
         trailingStopPercent: this.config.trailingStopPercent,
@@ -525,6 +529,36 @@ export class SimulationExecutor implements ITradingExecutor {
 
   getBalanceLamports(): BN {
     return this.virtualBalanceLamports;
+  }
+
+  /**
+   * Charge a platform fee from the virtual balance.
+   *
+   * In simulation mode this is a pure book-keeping operation — no Solana
+   * transaction is emitted. The fee comes out of the same virtual balance
+   * the bot trades from, so it shows up in the dashboard as a balance drop.
+   *
+   * Returns success=false if the bot can't afford the fee. Caller decides
+   * whether to skip the fee silently or block the trade — current policy is
+   * to skip silently and log a ledger row with txSignature=null.
+   */
+  async chargeFee(
+    feeLamports: number,
+    _collectorWallet: string
+  ): Promise<{ success: boolean; txSignature: string | null; error?: string }> {
+    if (feeLamports <= 0) {
+      return { success: true, txSignature: null };
+    }
+    const fee = new BN(feeLamports);
+    if (fee.gt(this.virtualBalanceLamports)) {
+      return {
+        success: false,
+        txSignature: null,
+        error: `Insufficient virtual balance for fee (${feeLamports} lamports)`,
+      };
+    }
+    this.virtualBalanceLamports = this.virtualBalanceLamports.sub(fee);
+    return { success: true, txSignature: null };
   }
 
   // ── Performance Summary ──

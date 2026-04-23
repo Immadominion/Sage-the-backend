@@ -266,7 +266,18 @@ export interface MarketScore {
 // Bot Configuration
 // ═══════════════════════════════════════════════════════════════
 
-export type StrategyMode = "rule-based" | "aura-ai" | "both";
+export type StrategyMode = "rule-based" | "aura-ai" | "both" | "llm";
+
+export interface LlmConfig {
+  /** Anthropic API key stored encrypted in DB — decrypted in-memory only */
+  anthropicApiKey: string;
+  /** Model ID. Defaults to claude-haiku-4-5-20251001 */
+  model?: string;
+  /** Hard daily USD spend cap. Undefined = unlimited */
+  maxUsdPerDay?: number;
+  /** Max pools to include in a single prompt. Defaults to 10 */
+  maxPoolsPerCall?: number;
+}
 
 export interface BotConfig {
   mode: ExecutionMode;
@@ -312,6 +323,9 @@ export interface BotConfig {
   cronIntervalSeconds: number;
   positionCheckIntervalSeconds: number;
 
+  // LLM mode config (only present when strategyMode === "llm")
+  llmConfig?: LlmConfig;
+
   // Simulation
   simulation?: {
     initialBalanceSOL: number;
@@ -348,7 +362,10 @@ export interface ITradingExecutor {
     poolAddress: string,
     strategy: StrategyParameters,
     amountX: BN,
-    amountY: BN
+    amountY: BN,
+    options?: {
+      maxHoldTimeMinutes?: number;
+    }
   ): Promise<OpenPositionResult>;
 
   closePosition(
@@ -359,6 +376,21 @@ export interface ITradingExecutor {
   updatePositionData(positionId: string): Promise<TrackedPosition | null>;
   getActivePositions(): TrackedPosition[];
   getBalance(): Promise<BN>;
+  /**
+   * Charge a platform fee from this bot's wallet.
+   *
+   * - Simulation: deducts from the virtual balance.
+   * - Live: sends a SystemProgram.transfer to the collector wallet.
+   *
+   * Returns the resulting txSignature on live mode (null in sim).
+   * Returns success=false if the bot doesn't have enough balance to cover
+   * the fee — the caller should treat this as a soft failure (fee skipped,
+   * not the position itself).
+   */
+  chargeFee(
+    feeLamports: number,
+    collectorWallet: string
+  ): Promise<{ success: boolean; txSignature: string | null; error?: string }>;
   getPerformanceSummary(): {
     totalPositions: number;
     wins: number;
@@ -387,6 +419,7 @@ export type BotEventType =
   | "position:opened"
   | "position:closed"
   | "position:updated"
+  | "fee:charged"
   | "scan:completed"
   | "engine:started"
   | "engine:stopped"

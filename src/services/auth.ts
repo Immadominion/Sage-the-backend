@@ -19,7 +19,7 @@ import crypto from "node:crypto";
 import config from "../config.js";
 import db from "../db/index.js";
 import { users } from "../db/schema.js";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 
 // ═══════════════════════════════════════════════════════════════
 // Types
@@ -28,6 +28,8 @@ import { eq } from "drizzle-orm";
 export interface AuraJWTPayload extends JWTPayload {
   sub: string; // wallet address
   userId: number;
+  /** Bumped on logout/all-device revocation. Refresh-time mismatch → reject. */
+  tv?: number;
 }
 
 export interface AuthTokens {
@@ -56,7 +58,11 @@ const NONCE_TTL_SECONDS = 300; // 5 minutes
  * Standalone nonces not tied to a wallet address.
  * Used when the mobile client fetches a nonce before knowing
  * the wallet address (pre-MWA flow on Seeker).
+ *
+ * Bounded: rejects new entries above MAX_STANDALONE_NONCES to prevent
+ * an unauthenticated attacker filling memory between the 60s sweeps.
  */
+const MAX_STANDALONE_NONCES = 10_000;
 const standaloneNonces = new Map<string, number>(); // nonce → expiresAt
 
 /** Periodically clean expired standalone nonces (every 60s). */
@@ -66,6 +72,21 @@ setInterval(() => {
     if (expiresAt < now) standaloneNonces.delete(nonce);
   }
 }, 60_000);
+
+/** Internal helper used by `generateNonce` — throws if we're at capacity. */
+function insertStandaloneNonce(nonce: string, expiresAt: number): void {
+  if (standaloneNonces.size >= MAX_STANDALONE_NONCES) {
+    // One opportunistic sweep before giving up
+    const now = Math.floor(Date.now() / 1000);
+    for (const [k, v] of standaloneNonces) if (v < now) standaloneNonces.delete(k);
+  }
+  if (standaloneNonces.size >= MAX_STANDALONE_NONCES) {
+    const err = new Error("Nonce store at capacity, try again shortly") as Error & { statusCode?: number };
+    err.statusCode = 429;
+    throw err;
+  }
+  standaloneNonces.set(nonce, expiresAt);
+}
 
 /**
  * Generate a random nonce.
@@ -99,8 +120,8 @@ export async function generateNonce(walletAddress: string | null): Promise<strin
         });
     }
   } else {
-    // MWA-safe flow: store nonce in memory
-    standaloneNonces.set(nonce, expiresAt);
+    // MWA-safe flow: store nonce in memory (bounded)
+    insertStandaloneNonce(nonce, expiresAt);
   }
 
   return nonce;
@@ -165,12 +186,17 @@ export async function verifySIWSSignature(
     throw new Error("Invalid signature");
   }
 
-  // 3. Extract nonce from message
-  const nonceMatch = message.match(/Nonce: (.+)/);
-  if (!nonceMatch) {
+  // 3. Extract nonce from message — strict, anchored, single-match.
+  // We require exactly one `Nonce: <token>` line; defends against attackers
+  // who try to smuggle multiple nonce lines into a custom-shaped message.
+  const nonceMatches = message.match(/^Nonce: ([A-Za-z0-9_-]+)$/gm);
+  if (!nonceMatches || nonceMatches.length === 0) {
     throw new Error("Message does not contain a nonce");
   }
-  const messageNonce = nonceMatch[1].trim();
+  if (nonceMatches.length > 1) {
+    throw new Error("Message contains multiple nonce lines");
+  }
+  const messageNonce = nonceMatches[0].slice("Nonce: ".length).trim();
 
   // 4. Verify nonce — check standalone store first, then user record
   const now = Math.floor(Date.now() / 1000);
@@ -246,9 +272,17 @@ export async function issueTokens(
   userId: number,
   walletAddress: string
 ): Promise<AuthTokens> {
+  // Read current tokenVersion so refresh-time check can reject revoked sessions
+  const [u] = await db
+    .select({ tokenVersion: users.tokenVersion })
+    .from(users)
+    .where(eq(users.walletAddress, walletAddress));
+  const tv = u?.tokenVersion ?? 0;
+
   const accessToken = await new SignJWT({
     sub: walletAddress,
     userId,
+    tv,
   } satisfies AuraJWTPayload)
     .setProtectedHeader({ alg: "HS256" })
     .setIssuedAt()
@@ -259,6 +293,7 @@ export async function issueTokens(
   const refreshToken = await new SignJWT({
     sub: walletAddress,
     userId,
+    tv,
     type: "refresh",
   })
     .setProtectedHeader({ alg: "HS256" })
@@ -322,6 +357,29 @@ export async function refreshTokens(
     throw new Error("Refresh token revoked or invalid");
   }
 
+  // Reject if the user has bumped their tokenVersion (logout / revoke-all)
+  // since this refresh token was issued.
+  const tokenTv = typeof payload.tv === "number" ? payload.tv : 0;
+  if (tokenTv !== refreshUser.tokenVersion) {
+    throw new Error("Refresh token revoked (token version mismatch)");
+  }
+
   // Issue new token pair (rotation)
   return issueTokens(refreshUser.id, refreshUser.walletAddress);
+}
+
+/**
+ * Revoke every outstanding session for a user.
+ * Bumps tokenVersion (kills any non-expired access tokens at refresh time)
+ * AND clears refreshTokenHash (kills the in-flight refresh chain immediately).
+ */
+export async function revokeAllTokens(userId: number): Promise<void> {
+  await db
+    .update(users)
+    .set({
+      refreshTokenHash: null,
+      tokenVersion: sql`${users.tokenVersion} + 1`,
+      updatedAt: new Date(),
+    })
+    .where(eq(users.id, userId));
 }

@@ -1,17 +1,19 @@
 /**
- * ML routes — In-process XGBoost model status and prediction endpoints.
+ * ML routes — In-process XGBoost model status, ops, and feedback export.
  *
- * GET  /ml/health    — model status + info
- * POST /ml/predict   — direct prediction from features (for testing/debugging)
- * POST /ml/reload    — hot-reload the model from disk
- * GET  /ml/feedback  — export closed positions with V3 features for online learning
+ * GET  /ml/health    — model status (public, used by mobile status badge)
+ * POST /ml/reload    — admin-only hot-reload (x-admin-token)
+ * GET  /ml/feedback  — admin-only export for active learning pipeline
+ *
+ * The bulk-prediction endpoint (POST /ml/predict) was removed 2026-04-23 —
+ * the engine calls MLPredictor in-process and there was never a non-debug
+ * client. See tmp/aura-backend-mobile-coupling-audit-2026-04-23.md.
  */
 
 import { Hono } from "hono";
-import { z } from "zod";
-import { zValidator } from "@hono/zod-validator";
-import { requireAuth, type AuthVariables } from "../middleware/auth.js";
+import { requireAdmin } from "../middleware/admin.js";
 import { createApiError } from "../middleware/error.js";
+import { logger } from "../middleware/logger.js";
 import { MLPredictor } from "../engine/ml-predictor.js";
 import { V3_FEATURE_NAMES } from "../engine/ml-features.js";
 import db from "../db/index.js";
@@ -19,7 +21,7 @@ import { positions } from "../db/schema.js";
 import { eq, and, isNotNull } from "drizzle-orm";
 import { LAMPORTS_PER_SOL } from "../engine/types.js";
 
-const ml = new Hono<{ Variables: AuthVariables }>();
+const ml = new Hono();
 
 // Shared ML predictor instance (in-process, no HTTP)
 const mlPredictor = new MLPredictor({ enabled: true });
@@ -46,53 +48,15 @@ ml.get("/health", async (c) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// Auth-protected: Direct Prediction
+// Admin: Reload Model
 // ═══════════════════════════════════════════════════════════════
 
-const predictSchema = z.object({
-  features: z
-    .array(z.array(z.number()).length(12))
-    .min(1)
-    .max(100)
-    .describe("2D array: each row is 12 V3 features in order"),
-  poolAddresses: z
-    .array(z.string())
-    .optional()
-    .describe("Optional pool addresses for labeling"),
-});
-
-ml.post(
-  "/predict",
-  requireAuth,
-  zValidator("json", predictSchema),
-  async (c) => {
-    const body = c.req.valid("json");
-
-    const predictions = await mlPredictor.predictBatch(
-      body.features,
-      body.poolAddresses
-    );
-
-    if (!predictions) {
-      throw createApiError("Could not reach the ML prediction service", 503);
-    }
-
-    return c.json({
-      predictions,
-      featureOrder: V3_FEATURE_NAMES,
-      count: predictions.length,
-    });
-  }
-);
-
-// ═══════════════════════════════════════════════════════════════
-// Auth-protected: Reload Model
-// ═══════════════════════════════════════════════════════════════
-
-ml.post("/reload", requireAuth, async (c) => {
+ml.post("/reload", requireAdmin, async (c) => {
   const result = mlPredictor.reloadModel();
   if (!result.success) {
-    throw createApiError(`Reload failed: ${result.error}`, 500);
+    // Do not leak filesystem paths or library internals to the client.
+    logger.error({ err: result.error }, "ml.reload failed");
+    throw createApiError("ML model reload failed", 500);
   }
   return c.json({ status: "reloaded", model: result.model });
 });
@@ -114,7 +78,7 @@ ml.post("/reload", requireAuth, async (c) => {
  * Response format matches what online_learning.py expects.
  * Requires auth — internal ML pipeline uses service token.
  */
-ml.get("/feedback", requireAuth, async (c) => {
+ml.get("/feedback", requireAdmin, async (c) => {
   const since = Number(c.req.query("since") || "0");
   const limit = Math.min(Number(c.req.query("limit") || "1000"), 5000);
 

@@ -20,8 +20,8 @@ import { Connection } from "@solana/web3.js";
 import BN from "bn.js";
 import config from "../config.js";
 import db from "../db/index.js";
-import { bots, positions, tradeLog, botDecisions } from "../db/schema.js";
-import { eq, and, lt } from "drizzle-orm";
+import { bots, positions, tradeLog, botDecisions, feeLedger } from "../db/schema.js";
+import { eq, and, lt, sql } from "drizzle-orm";
 import { logger } from "../middleware/logger.js";
 import { eventBus } from "./event-bus.js";
 import { TradingEngine, type EngineEvent, type EngineStats, type ScanDecision } from "./trading-engine.js";
@@ -32,6 +32,8 @@ import { MLPredictor } from "./ml-predictor.js";
 import { EmergencyStop } from "./emergency-stop.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
 import { getSharedCache } from "./shared-cache.js";
+import { LlmTrader } from "./llm-trader.js";
+import { decryptString } from "./crypto-utils.js";
 import type { BotConfig, TrackedPosition, MarketScore, StrategyMode, ITradingExecutor } from "./types.js";
 import { LAMPORTS_PER_SOL } from "./types.js";
 
@@ -48,6 +50,7 @@ interface RunningBot {
   executor: ITradingExecutor;
   marketData: MarketDataProvider;
   mlPredictor: MLPredictor | null;
+  llmTrader: LlmTrader | null;
   emergencyStop: EmergencyStop;
   circuitBreaker: CircuitBreaker;
   startedAt: number;
@@ -154,6 +157,34 @@ export class BotOrchestrator {
         { botId, model: health.model, threshold: health.threshold },
         "ML model ready (in-process)"
       );
+    }
+
+    // Create LlmTrader if bot uses LLM mode
+    let llmTrader: LlmTrader | null = null;
+    if (strategyMode === "llm") {
+      if (!botRow.encryptedLlmApiKey) {
+        throw new Error(
+          `LLM mode requires an Anthropic API key — encryptedLlmApiKey is not set on bot ${botId}. ` +
+          `Set the key via the bot settings API before starting in llm mode.`
+        );
+      }
+      try {
+        const apiKey = decryptString(botRow.encryptedLlmApiKey, config.MASTER_ENCRYPTION_KEY);
+        llmTrader = new LlmTrader({
+          apiKey,
+          model: botRow.llmModel ?? undefined,
+          maxPoolsPerCall: botRow.llmMaxPoolsPerCall ?? undefined,
+          maxUsdPerDay: botRow.llmMaxUsdPerDay ?? undefined,
+        });
+        log.info(
+          { botId, model: botRow.llmModel ?? "claude-haiku-4-5-20251001", maxUsdPerDay: botRow.llmMaxUsdPerDay },
+          "LLM trader created"
+        );
+      } catch (err) {
+        throw new Error(
+          `Failed to decrypt LLM API key for bot ${botId}: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
     }
 
     // Create safety systems per-bot
@@ -283,7 +314,7 @@ export class BotOrchestrator {
       );
     }
 
-    // Create TradingEngine with event callback, ML predictor, and safety systems
+    // Create TradingEngine with event callback, ML predictor, LLM trader, and safety systems
     const engine = new TradingEngine(
       botConfig,
       executor,
@@ -292,7 +323,8 @@ export class BotOrchestrator {
       botId,
       mlPredictor,
       emergencyStop,
-      circuitBreaker
+      circuitBreaker,
+      llmTrader
     );
 
     const running: RunningBot = {
@@ -302,6 +334,7 @@ export class BotOrchestrator {
       executor,
       marketData,
       mlPredictor,
+      llmTrader,
       emergencyStop,
       circuitBreaker,
       startedAt: Date.now(),
@@ -636,6 +669,9 @@ export class BotOrchestrator {
       case "position:updated":
         this.onPositionUpdated(botId, userId, event.position);
         break;
+      case "fee:charged":
+        this.onFeeCharged(botId, userId, event);
+        break;
       case "scan:completed":
         this.onScanCompleted(botId, userId, event.eligible, event.entered, event.scanId, event.decisions);
         break;
@@ -831,6 +867,59 @@ export class BotOrchestrator {
           err: error instanceof Error ? error.message : String(error),
         },
         "Failed to persist position close"
+      );
+    }
+  }
+
+  // ── Fee Charged ──
+
+  private async onFeeCharged(
+    botId: string,
+    userId: number,
+    event: Extract<EngineEvent, { type: "fee:charged" }>
+  ): Promise<void> {
+    try {
+      // Always write the ledger row, even on failure — operator visibility.
+      await db.insert(feeLedger).values({
+        botId,
+        userId,
+        positionId: event.positionId,
+        mode: event.mode,
+        strategyMode: event.strategyMode as "rule-based" | "aura-ai" | "both" | "llm",
+        feeType: event.feeType,
+        positionSizeLamports: event.positionSizeLamports,
+        feeBps: event.feeBps,
+        feeLamports: event.feeLamports,
+        collectorWallet: event.collectorWallet,
+        txSignature: event.txSignature,
+      });
+
+      // Only increment the cumulative counter for successful charges.
+      if (event.success) {
+        await db.update(bots)
+          .set({
+            totalFeesPaidLamports: sql`${bots.totalFeesPaidLamports} + ${event.feeLamports}`,
+            updatedAt: new Date(),
+          })
+          .where(eq(bots.botId, botId));
+      }
+
+      eventBus.emitBotEvent("fee:charged", botId, userId, {
+        positionId: event.positionId,
+        feeBps: event.feeBps,
+        feeLamports: event.feeLamports,
+        feeSol: event.feeLamports / LAMPORTS_PER_SOL,
+        success: event.success,
+        txSignature: event.txSignature,
+      });
+    } catch (err) {
+      log.error(
+        {
+          botId,
+          err: err instanceof Error ? err.message : String(err),
+          feeLamports: event.feeLamports,
+        },
+        "Failed to persist fee ledger row"
       );
     }
   }
@@ -1054,6 +1143,10 @@ export class BotOrchestrator {
       simulation: {
         initialBalanceSOL: row.simulationBalanceSOL,
       },
+      // llmConfig is intentionally omitted here — the LlmTrader instance is
+      // created separately in _startBot() with the decrypted key, and injected
+      // directly into TradingEngine. BotConfig.llmConfig is reserved for
+      // read-only metadata if needed in future.
     };
   }
 

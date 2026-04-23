@@ -8,6 +8,7 @@
  * POST   /bot/:botId/start   — start bot
  * POST   /bot/:botId/stop    — stop bot
  * POST   /bot/:botId/emergency — emergency close all positions
+ * POST   /bot/:botId/reset-stats — reset stats + balance to zero (fix stale DB data)
  * POST   /bot/:botId/convert-to-live — convert simulation to live
  * DELETE /bot/:botId         — delete stopped bot
  */
@@ -17,7 +18,7 @@ import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
 import crypto from "node:crypto";
 import { createApiError } from "../middleware/error.js";
-import { generateEncryptedKeypair } from "../engine/crypto-utils.js";
+import { generateEncryptedKeypair, encryptString } from "../engine/crypto-utils.js";
 import db from "../db/index.js";
 import { bots, users, positions, tradeLog, botDecisions } from "../db/schema.js";
 import { eq, and, sql, isNull, desc } from "drizzle-orm";
@@ -39,7 +40,12 @@ bot.use("/*", requireAuth);
 const baseBotConfigSchema = z.object({
   name: z.string().min(1).max(64).optional(),
   mode: z.enum(["simulation", "live"]).default("simulation"),
-  strategyMode: z.enum(["rule-based", "aura-ai", "both"]).default("rule-based"),
+  strategyMode: z.enum(["rule-based", "aura-ai", "both", "llm"]).default("rule-based"),
+  // LLM mode — optional Anthropic API key (plaintext; encrypted before storage)
+  llmApiKey: z.string().min(10).max(300).optional(),
+  llmModel: z.string().max(80).optional(),
+  llmMaxUsdPerDay: z.number().positive().max(1000).optional(),
+  llmMaxPoolsPerCall: z.number().int().min(1).max(50).optional(),
   // Entry criteria
   entryScoreThreshold: z.number().positive().default(150),
   /** ML probability threshold override (0-1). Omit to use model default. */
@@ -215,6 +221,11 @@ bot.post("/create", zValidator("json", createBotSchema), async (c) => {
     ownerWallet = user?.walletAddress;
   }
 
+  // Encrypt LLM API key if provided
+  const encryptedLlmApiKey = body.llmApiKey
+    ? encryptString(body.llmApiKey, config.MASTER_ENCRYPTION_KEY)
+    : undefined;
+
   await db.insert(bots)
     .values({
       botId,
@@ -225,6 +236,10 @@ bot.post("/create", zValidator("json", createBotSchema), async (c) => {
       encryptedPrivateKey: encryptedPrivateKey ?? null,
       ownerWallet: ownerWallet ?? null,
       strategyMode: body.strategyMode,
+      encryptedLlmApiKey: encryptedLlmApiKey ?? null,
+      llmModel: body.llmModel ?? null,
+      llmMaxUsdPerDay: body.llmMaxUsdPerDay ?? null,
+      llmMaxPoolsPerCall: body.llmMaxPoolsPerCall ?? null,
       entryScoreThreshold: body.entryScoreThreshold,
       mlThreshold: body.mlThreshold ?? null,
       minVolume24h: body.minVolume24h,
@@ -415,9 +430,16 @@ bot.put(
     const resetBalance = updates.simulationBalanceSOL != null &&
       updates.simulationBalanceSOL !== botData.simulationBalanceSOL;
 
+    // Extract LLM API key before spreading — must be encrypted before DB write
+    const { llmApiKey: plaintextLlmApiKey, ...otherUpdates } = updates;
+    const llmKeyUpdate = plaintextLlmApiKey != null
+      ? { encryptedLlmApiKey: encryptString(plaintextLlmApiKey, config.MASTER_ENCRYPTION_KEY) }
+      : {};
+
     await db.update(bots)
       .set({
-        ...updates,
+        ...otherUpdates,
+        ...llmKeyUpdate,
         ...(resetBalance
           ? {
             currentVirtualBalanceLamports: null,
@@ -637,6 +659,59 @@ bot.post("/:botId/emergency", async (c) => {
 });
 
 /**
+ * POST /bot/:botId/reset-stats
+ * Reset all accumulated stats and virtual balance for a stopped bot.
+ *
+ * Needed when the database contains inflated P&L figures from historical
+ * simulation bugs (e.g., non-SOL-quoted pools being simulated before the
+ * mint_y guard was added). Clears totalPnlLamports, totalTrades,
+ * winningTrades, and currentVirtualBalanceLamports so the next run starts
+ * fresh from the configured simulationBalanceSOL.
+ *
+ * Only allowed when the bot is stopped.
+ */
+bot.post("/:botId/reset-stats", async (c) => {
+  const userId = c.var.userId;
+  const botId = c.req.param("botId");
+  validateBotId(botId);
+
+  const botData = await getUserBot(userId, botId);
+  if (!botData) throw createApiError("Bot not found", 404);
+
+  if (
+    botData.status === "running" ||
+    botData.status === "starting" ||
+    botData.status === "stopping"
+  ) {
+    throw createApiError("Stop the bot before resetting stats.", 400);
+  }
+
+  await db
+    .update(bots)
+    .set({
+      totalTrades: 0,
+      winningTrades: 0,
+      totalPnlLamports: 0,
+      // Null triggers the next start to use simulationBalanceSOL as the initial balance.
+      currentVirtualBalanceLamports: null,
+      emergencyStopState: null,
+      lastError: null,
+      updatedAt: new Date(),
+    })
+    .where(and(eq(bots.botId, botId), eq(bots.userId, userId)));
+
+  await db.insert(tradeLog).values({
+    botId,
+    userId,
+    event: "bot_started", // closest available enum value
+    details: JSON.stringify({ action: "stats_reset", reason: "manual_reset" }),
+  });
+
+  const updated = await getUserBot(userId, botId);
+  return c.json({ success: true, bot: sanitizeBot(updated!) });
+});
+
+/**
  * POST /bot/:botId/convert-to-live
  * Convert a simulation bot to live mode.
  * Generates an encrypted keypair and resets stats.
@@ -794,5 +869,10 @@ bot.get("/:botId/decisions", async (c) => {
 
   return c.json({ success: true, decisions: rows });
 });
+
+// NOTE: GET /:botId/fees and /bot/fees/summary were removed 2026-04-23.
+// `bots.totalFeesPaidLamports` is already returned on the bot detail object,
+// and the `fee_ledger` table remains the source of truth for engine writes
+// and future tax-export endpoints. See tmp/aura-backend-mobile-coupling-audit-2026-04-23.md.
 
 export default bot;

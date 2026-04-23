@@ -20,14 +20,15 @@ import type {
   MarketScore,
 } from "./types.js";
 import { StrategyType, LAMPORTS_PER_SOL, SOL_MINT } from "./types.js";
-import { MLPredictor, type MLPrediction } from "./ml-predictor.js";
-import {
+import { MLPredictor, type MLPrediction } from "./ml-predictor.js"; import {
   extractV3Features,
   featuresToArray,
   type V3Features,
 } from "./ml-features.js";
 import { EmergencyStop } from "./emergency-stop.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
+import { LlmTrader, llmDecisionToScore } from "./llm-trader.js";
+import { calculateTradeFee } from "./fee-calculator.js";
 import { logger } from "../middleware/logger.js";
 
 const log = logger.child({ module: "trading-engine" });
@@ -64,6 +65,14 @@ function calculatePositionSize(config: BotConfig, balanceLamports: BN): BN {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parseStrategyType(value: unknown): StrategyType {
+  if (!value || typeof value !== "string") return StrategyType.Spot;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "curve") return StrategyType.Curve;
+  if (normalized === "bidask" || normalized === "bid-ask") return StrategyType.BidAsk;
+  return StrategyType.Spot;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -104,6 +113,20 @@ export type EngineEvent =
   | { type: "position:opened"; position: TrackedPosition; score: MarketScore }
   | { type: "position:closed"; position: TrackedPosition; pnlLamports: BN }
   | { type: "position:updated"; position: TrackedPosition }
+  | {
+    type: "fee:charged";
+    positionId: string | null;
+    mode: "simulation" | "live";
+    strategyMode: string;
+    feeType: "entry" | "exit";
+    positionSizeLamports: number;
+    feeBps: number;
+    feeLamports: number;
+    collectorWallet: string;
+    txSignature: string | null;
+    success: boolean;
+    error?: string;
+  }
   | { type: "scan:completed"; eligible: number; entered: number; scanId: string; decisions: ScanDecision[] }
   | { type: "engine:started" }
   | { type: "engine:stopped"; stats: EngineStats }
@@ -127,6 +150,7 @@ export class TradingEngine {
   private marketData: IMarketDataProvider;
   private onEvent: EngineEventCallback;
   private mlPredictor: MLPredictor | null;
+  private llmTrader: LlmTrader | null;
 
   // Safety systems
   readonly emergencyStop: EmergencyStop;
@@ -151,13 +175,15 @@ export class TradingEngine {
     label = "engine",
     mlPredictor: MLPredictor | null = null,
     emergencyStop?: EmergencyStop,
-    circuitBreaker?: CircuitBreaker
+    circuitBreaker?: CircuitBreaker,
+    llmTrader: LlmTrader | null = null
   ) {
     this.config = config;
     this.executor = executor;
     this.marketData = marketData;
     this.onEvent = onEvent;
     this.mlPredictor = mlPredictor;
+    this.llmTrader = llmTrader;
     this.label = label;
 
     // Safety systems — create defaults if not injected
@@ -450,6 +476,22 @@ export class TradingEngine {
           });
         }
         const result = await this.scoreHybridFull(availablePools, slotsAvailable);
+        topPools = result.qualifying;
+        allScored = result.all;
+      } else if (strategyMode === "llm") {
+        if (!this.llmTrader) {
+          log.error(
+            { label: this.label },
+            "llm mode requires LLM trader but it is not configured. " +
+            "Set an Anthropic API key for this bot or switch to a different mode."
+          );
+          this.onEvent({
+            type: "engine:error",
+            error: "LLM trader not configured — set an Anthropic API key for this bot.",
+          });
+          return;
+        }
+        const result = await this.scoreLlmFull(availablePools, slotsAvailable);
         topPools = result.qualifying;
         allScored = result.all;
       } else {
@@ -814,6 +856,104 @@ export class TradingEngine {
     return { qualifying: final, all: scoredPools };
   }
 
+  /**
+   * LLM scoring — sends candidate pools to Claude, returns qualifying entries.
+   * Decisions carry llmStrategy/llmBinHalfWidth/maxHoldTimeMinutesOverride hints
+   * that enterPosition() will consume via the score object cast.
+   */
+  private async scoreLlmFull(
+    pools: MeteoraPairData[],
+    slotsAvailable: number
+  ): Promise<{ qualifying: { pool: MeteoraPairData; score: MarketScore }[]; all: { pool: MeteoraPairData; score: MarketScore }[] }> {
+    if (!this.llmTrader) return { qualifying: [], all: [] };
+
+    // Pre-filter by basic liquidity/volume thresholds to keep prompt small
+    const candidates = pools
+      .filter(
+        (p) =>
+          (p.trade_volume_24h ?? 0) >= this.config.minVolume24h &&
+          parseFloat(p.liquidity) >= this.config.minLiquidity
+      )
+      .sort((a, b) => (b.volume?.hour_1 ?? 0) - (a.volume?.hour_1 ?? 0));
+
+    if (candidates.length === 0) {
+      log.debug({ label: this.label, mode: "llm" }, "No candidates passed pre-filter for LLM");
+      return { qualifying: [], all: [] };
+    }
+
+    const activePositionPools = this.executor
+      .getActivePositions()
+      .map((p) => p.poolAddress);
+
+    const balanceLamports = await this.executor.getBalance();
+    const walletBalanceSOL = balanceLamports.toNumber() / LAMPORTS_PER_SOL;
+
+    log.info(
+      { label: this.label, mode: "llm", candidates: candidates.length },
+      "Sending pools to LLM for evaluation"
+    );
+
+    const batch = await this.llmTrader.evaluatePools(
+      candidates,
+      activePositionPools,
+      walletBalanceSOL
+    );
+
+    if (batch.status === "budget_blocked") {
+      this.onEvent({ type: "engine:warning", message: batch.statusMessage });
+      return { qualifying: [], all: [] };
+    }
+
+    if (batch.status === "api_error") {
+      log.error({ label: this.label, err: batch.statusMessage }, "LLM API error during scoring");
+      this.onEvent({ type: "engine:error", error: `LLM API error: ${batch.statusMessage}` });
+      return { qualifying: [], all: [] };
+    }
+
+    if (batch.status === "parse_failed") {
+      log.warn({ label: this.label }, "LLM returned unparseable output — skipping scan cycle");
+      return { qualifying: [], all: [] };
+    }
+
+    // Map pool address → pool object for quick lookup
+    const poolByAddress = new Map(candidates.map((p) => [p.address, p]));
+
+    const all: { pool: MeteoraPairData; score: MarketScore }[] = [];
+    const qualifying: { pool: MeteoraPairData; score: MarketScore }[] = [];
+
+    for (const decision of batch.decisions) {
+      const pool = poolByAddress.get(decision.poolAddress);
+      if (!pool) {
+        log.warn(
+          { label: this.label, poolAddress: decision.poolAddress },
+          "LLM returned decision for unknown pool address — ignored"
+        );
+        continue;
+      }
+      const score = llmDecisionToScore(decision);
+      all.push({ pool, score });
+      if (decision.enter) qualifying.push({ pool, score });
+    }
+
+    log.info(
+      {
+        label: this.label,
+        mode: "llm",
+        evaluated: batch.decisions.length,
+        enter: qualifying.length,
+        latencyMs: batch.latencyMs,
+        costUSD: batch.costUSD,
+        status: batch.status,
+      },
+      "LLM scoring complete"
+    );
+
+    return {
+      qualifying: qualifying.slice(0, slotsAvailable),
+      all,
+    };
+  }
+
   // ── Decision Reason Builder ──
 
   private buildSkipReason(
@@ -821,6 +961,9 @@ export class TradingEngine {
     mlPrediction: MLPrediction | undefined,
     strategyMode: string
   ): string {
+    if (strategyMode === "llm") {
+      return `LLM rejected (confidence ${score.totalScore ? (score.totalScore / 1000).toFixed(2) : "n/a"})`;
+    }
     if (strategyMode === "aura-ai" && mlPrediction) {
       return `ML probability ${mlPrediction.probability.toFixed(4)} below threshold`;
     }
@@ -859,11 +1002,18 @@ export class TradingEngine {
         return false;
       }
 
-      const binRange = this.config.defaultBinRange ?? 10;
+      const strategyHint = (score as unknown as { mlStrategy?: string }).mlStrategy;
+      const binHalfWidthHint = (score as unknown as { mlBinHalfWidth?: number }).mlBinHalfWidth;
+      const holdOverrideHint = (score as unknown as { maxHoldTimeMinutesOverride?: number }).maxHoldTimeMinutesOverride;
+
+      const binHalfWidth = Number.isFinite(binHalfWidthHint)
+        ? Math.max(1, Math.min(50, Math.round(binHalfWidthHint as number)))
+        : (this.config.defaultBinRange ?? 10);
+
       const strategy: StrategyParameters = {
-        minBinId: activeBin.binId - binRange,
-        maxBinId: activeBin.binId + binRange,
-        strategyType: StrategyType.Spot,
+        minBinId: activeBin.binId - binHalfWidth,
+        maxBinId: activeBin.binId + binHalfWidth,
+        strategyType: parseStrategyType(strategyHint),
       };
 
       // Determine which pool side is SOL so the DLMM SDK generates
@@ -896,7 +1046,12 @@ export class TradingEngine {
         pool.address,
         strategy,
         amountX,
-        amountY
+        amountY,
+        {
+          maxHoldTimeMinutes: Number.isFinite(holdOverrideHint)
+            ? Math.max(15, Math.min(1440, Math.round(holdOverrideHint as number)))
+            : undefined,
+        }
       );
 
       if (result.success && result.positionId) {
@@ -925,6 +1080,45 @@ export class TradingEngine {
             position: newPos,
             score,
           });
+        }
+
+        // ── Platform Fee Collection ──
+        // Charge a small per-trade fee. Done AFTER the position is opened so
+        // we never charge for failed trades. Failure here is non-fatal — the
+        // position is already open; we just emit a fee:charged event with
+        // success=false so the orchestrator can write a ledger row that the
+        // operator can reconcile/retry later.
+        try {
+          const fee = calculateTradeFee(totalAmount.toNumber(), this.config.strategyMode ?? "rule-based");
+          if (fee.enabled && fee.feeLamports > 0 && fee.collectorWallet) {
+            const charge = await this.executor.chargeFee(fee.feeLamports, fee.collectorWallet);
+            this.onEvent({
+              type: "fee:charged",
+              positionId: result.positionId ?? null,
+              mode: this.config.mode === "LIVE" ? "live" : "simulation",
+              strategyMode: this.config.strategyMode ?? "rule-based",
+              feeType: "entry",
+              positionSizeLamports: totalAmount.toNumber(),
+              feeBps: fee.feeBps,
+              feeLamports: fee.feeLamports,
+              collectorWallet: fee.collectorWallet,
+              txSignature: charge.txSignature,
+              success: charge.success,
+              error: charge.error,
+            });
+            if (!charge.success) {
+              log.warn(
+                { label: this.label, positionId: result.positionId, error: charge.error, feeLamports: fee.feeLamports },
+                "Fee charge failed (position remains open)"
+              );
+            }
+          }
+        } catch (feeErr) {
+          // Never let fee accounting bring down a successful trade
+          log.error(
+            { label: this.label, err: feeErr instanceof Error ? feeErr.message : String(feeErr) },
+            "Unexpected error during fee collection"
+          );
         }
 
         log.info(
