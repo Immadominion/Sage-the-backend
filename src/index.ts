@@ -96,13 +96,17 @@ function parseCorsOrigins(raw: string): string | string[] {
   return list;
 }
 
-const corsOrigins = parseCorsOrigins(config.CORS_ORIGINS);
+let corsOrigins = parseCorsOrigins(config.CORS_ORIGINS);
 
 if (config.NODE_ENV === "production" && corsOrigins === "*") {
-  // Defence-in-depth: config.ts hard-fails this case, but if env is mutated at runtime
-  // we refuse to wildcard CORS in production.
-  logger.error("CORS_ORIGINS resolved to wildcard in production — refusing to start");
-  process.exit(1);
+  // Defence-in-depth: wildcard + credentials:true is invalid and unsafe.
+  // Fall back to the canonical production origin instead of killing the
+  // container — /health must stay up so operators can fix the env var.
+  process.stdout.write(
+    "[boot] WARNING: CORS_ORIGINS='*' in production is unsafe with credentials:true. " +
+      "Falling back to https://useaura.wtf. Set CORS_ORIGINS to a comma-separated origin list.\n"
+  );
+  corsOrigins = ["https://useaura.wtf"];
 }
 
 logger.info(
