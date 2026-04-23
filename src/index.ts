@@ -171,11 +171,19 @@ app.notFound((c) => c.json({
 }, 404));
 
 // ═══════════════════════════════════════════════════════════════
-// Start Server (async — runs migrations first)
+// Start Server
 // ═══════════════════════════════════════════════════════════════
-
-// Run PostgreSQL migrations before starting server
-await runMigrations();
+//
+// Bind the HTTP listener BEFORE running migrations so /health responds
+// immediately. Railway (and most container platforms) will kill a container
+// whose health endpoint doesn't answer within ~2 minutes, and a slow or
+// briefly-unreachable DB during boot can blow past that window.
+//
+// Migrations run in the background; runMigrations() already calls
+// process.exit(1) on a real (non "already exists") failure, which Railway
+// will surface as a crash in the deploy logs. Until they finish the API
+// will return 5xx for any endpoint that touches the DB, but /health stays
+// up so the platform knows the process is alive.
 
 const server = serve(
   {
@@ -251,6 +259,16 @@ const server = serve(
     startDigestCron();
   }
 );
+
+// Run DB migrations in the background after the listener is bound. /health
+// stays available throughout so the platform's healthcheck succeeds even if
+// the DB is briefly unreachable during cold start.
+runMigrations().catch((err) => {
+  logger.error(
+    { err: err instanceof Error ? err.message : String(err) },
+    "Background migration run failed"
+  );
+});
 
 // Graceful shutdown with timeout
 const SHUTDOWN_TIMEOUT_MS = 30_000; // 30s max to stop bots and close

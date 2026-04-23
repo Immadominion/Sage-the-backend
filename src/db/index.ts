@@ -54,7 +54,7 @@ export async function runMigrations(): Promise<void> {
       console.log("ℹ️  Database schema up to date — skipping migration");
     } else {
       console.error("❌ Database migration failed:", err);
-      process.exit(1);
+      throw err;
     }
   }
 }
