@@ -72,6 +72,9 @@ function ensureInit(): boolean {
 export type PushCategory =
     | "position_opened"
     | "position_closed"
+    | "fee_charged"
+    | "bot_started"
+    | "bot_stopped"
     | "engine_error"
     | "daily_digest";
 

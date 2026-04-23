@@ -104,7 +104,7 @@ if (config.NODE_ENV === "production" && corsOrigins === "*") {
   // container — /health must stay up so operators can fix the env var.
   process.stdout.write(
     "[boot] WARNING: CORS_ORIGINS='*' in production is unsafe with credentials:true. " +
-      "Falling back to https://useaura.wtf. Set CORS_ORIGINS to a comma-separated origin list.\n"
+    "Falling back to https://useaura.wtf. Set CORS_ORIGINS to a comma-separated origin list.\n"
   );
   corsOrigins = ["https://useaura.wtf"];
 }

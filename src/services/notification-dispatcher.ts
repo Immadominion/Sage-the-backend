@@ -7,6 +7,9 @@
  * Wired events:
  *   • position:opened  → "Position opened" with pool + score
  *   • position:closed  → "Position closed" with PnL ± SOL
+ *   • fee:charged      → "Fee charged" with lamports/SOL amount
+ *   • engine:started   → "Bot started"
+ *   • engine:stopped   → "Bot stopped"
  *   • engine:error     → "Bot stopped" with redacted error message
  *
  * Per-event payloads come from `orchestrator.ts:emitBotEvent` calls; see
@@ -18,6 +21,8 @@
 import { eventBus } from "../engine/event-bus.js";
 import { logger } from "../middleware/logger.js";
 import { pushToUser } from "./fcm.js";
+
+const LAMPORTS_PER_SOL = 1_000_000_000;
 
 let started = false;
 
@@ -61,6 +66,53 @@ export function startNotificationDispatcher(): void {
             logger.warn(
                 { err: err instanceof Error ? err.message : String(err) },
                 "position_closed push failed"
+            );
+        });
+    });
+
+    // ── fee:charged ──
+    eventBus.on("fee:charged", (e) => {
+        const lamports = typeof e.data.feeLamports === "number" ? e.data.feeLamports : 0;
+        const sol = lamports / LAMPORTS_PER_SOL;
+        void pushToUser(e.userId, "fee_charged", {
+            title: "Fee charged",
+            body: `-${sol.toFixed(6)} SOL`,
+            data: {
+                botId: e.botId,
+                feeLamports: String(lamports),
+            },
+        }).catch((err) => {
+            logger.warn(
+                { err: err instanceof Error ? err.message : String(err) },
+                "fee_charged push failed"
+            );
+        });
+    });
+
+    // ── engine:started ──
+    eventBus.on("engine:started", (e) => {
+        void pushToUser(e.userId, "bot_started", {
+            title: "Bot started",
+            body: "Trading engine is running",
+            data: { botId: e.botId },
+        }).catch((err) => {
+            logger.warn(
+                { err: err instanceof Error ? err.message : String(err) },
+                "bot_started push failed"
+            );
+        });
+    });
+
+    // ── engine:stopped ──
+    eventBus.on("engine:stopped", (e) => {
+        void pushToUser(e.userId, "bot_stopped", {
+            title: "Bot stopped",
+            body: "Trading engine stopped",
+            data: { botId: e.botId },
+        }).catch((err) => {
+            logger.warn(
+                { err: err instanceof Error ? err.message : String(err) },
+                "bot_stopped push failed"
             );
         });
     });
