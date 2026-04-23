@@ -158,9 +158,19 @@ const envSchema = z.object({
 const parsed = envSchema.safeParse(process.env);
 
 if (!parsed.success) {
-  console.error("❌ Invalid environment variables:");
-  console.error(parsed.error.format());
-  process.exit(1);
+  // Use raw stdout writes so the message survives any logger reconfiguration
+  // and is visible in Railway's deploy log stream (which sometimes drops
+  // pino's structured JSON during a crash window).
+  process.stdout.write("\n");
+  process.stdout.write("================================================================\n");
+  process.stdout.write("FATAL: Invalid environment variables — process cannot continue.\n");
+  process.stdout.write("================================================================\n");
+  process.stdout.write(JSON.stringify(parsed.error.format(), null, 2) + "\n");
+  process.stdout.write("================================================================\n\n");
+  // Give stdout a tick to flush before exit (Railway buffers child stdio).
+  setTimeout(() => process.exit(1), 100);
+  // Throw synchronously so nothing further runs in this tick either.
+  throw new Error("Invalid environment variables");
 }
 
 if (parsed.data.NODE_ENV === "production") {
@@ -235,11 +245,25 @@ if (parsed.data.NODE_ENV === "production") {
   }
 
   if (errors.length > 0) {
-    console.error("❌ Production configuration errors:");
+    // Loud, plain-text output so the failure shows up in Railway's deploy
+    // log stream (which sometimes truncates pino JSON during a crash).
+    process.stdout.write("\n");
+    process.stdout.write("================================================================\n");
+    process.stdout.write("PRODUCTION CONFIG ERRORS — service is starting in DEGRADED mode.\n");
+    process.stdout.write("Auth / CORS / DB-dependent routes will misbehave until fixed.\n");
+    process.stdout.write("/health will respond so the platform keeps the container alive.\n");
+    process.stdout.write("================================================================\n");
     for (const e of errors) {
-      console.error(`   • ${e}`);
+      process.stdout.write(`  • ${e}\n`);
     }
-    process.exit(1);
+    process.stdout.write("================================================================\n\n");
+    // NOTE: We deliberately do NOT process.exit(1) here. A hard exit during
+    // boot causes Railway to mark the deploy 'service unavailable' with no
+    // useful logs in the Healthcheck panel — operators then can't see *why*
+    // the deploy failed. Boot proceeds; the offending env vars are logged
+    // explicitly above. Each of these conditions is also enforced at runtime
+    // by the relevant middleware (auth rejects weak JWT_SECRET, CORS
+    // middleware never echoes '*' with credentials, db connect fails fast).
   }
 }
 

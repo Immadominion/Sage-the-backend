@@ -11,6 +11,17 @@
  *  - Security: CORS lockdown, secure headers, body size limits, request IDs
  */
 
+// Plain stdout heartbeats — these survive any logger/transport configuration
+// and show up in Railway's deploy log stream so we can see how far boot got
+// before any failure.
+process.stdout.write(`[boot] aura-backend starting (pid=${process.pid}, node=${process.version})\n`);
+process.on("uncaughtException", (err) => {
+  process.stdout.write(`[boot] FATAL uncaughtException: ${err?.stack ?? err}\n`);
+});
+process.on("unhandledRejection", (reason) => {
+  process.stdout.write(`[boot] FATAL unhandledRejection: ${reason instanceof Error ? reason.stack : String(reason)}\n`);
+});
+
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
@@ -20,6 +31,8 @@ import { bodyLimit } from "hono/body-limit";
 import { logger as honoLogger } from "hono/logger";
 
 import config from "./config.js";
+process.stdout.write(`[boot] config loaded (PORT=${config.PORT}, NODE_ENV=${config.NODE_ENV})\n`);
+
 import { errorHandler } from "./middleware/error.js";
 import { logger } from "./middleware/logger.js";
 import { globalRateLimit, authRateLimit, botLifecycleRateLimit, readRateLimit, mlRateLimit, externalApiRateLimit } from "./middleware/rate-limit.js";
@@ -38,6 +51,7 @@ import aiRoutes from "./routes/ai.js";
 import fleetRoutes from "./routes/fleet.js";
 import analyticsRoutes from "./routes/analytics.js";
 import lpAgentRoutes from "./routes/lp-agent.js";
+process.stdout.write(`[boot] route imports complete\n`);
 
 // Engine
 import { orchestrator } from "./engine/orchestrator.js";
@@ -46,6 +60,7 @@ import { closeDatabase, runMigrations } from "./db/index.js";
 // Notifications
 import { startNotificationDispatcher } from "./services/notification-dispatcher.js";
 import { startDigestCron, stopDigestCron } from "./services/digest.js";
+process.stdout.write(`[boot] engine + service imports complete\n`);
 
 // ═══════════════════════════════════════════════════════════════
 // App
@@ -185,6 +200,8 @@ app.notFound((c) => c.json({
 // will return 5xx for any endpoint that touches the DB, but /health stays
 // up so the platform knows the process is alive.
 
+process.stdout.write(`[boot] about to bind HTTP listener on 0.0.0.0:${config.PORT}\n`);
+
 const server = serve(
   {
     fetch: app.fetch,
@@ -192,6 +209,7 @@ const server = serve(
     hostname: "0.0.0.0",
   },
   (info) => {
+    process.stdout.write(`[boot] HTTP listener bound on port ${info.port} — /health is live\n`);
     logger.info("═".repeat(60));
     logger.info("  Aura Backend API");
     logger.info("═".repeat(60));
