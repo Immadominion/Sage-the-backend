@@ -11,22 +11,28 @@
 # ── Stage 1: Build ────────────────────────────────────────────
 FROM node:22-alpine AS builder
 
+# Enable pnpm via corepack (project's source-of-truth lock file is pnpm-lock.yaml)
+RUN corepack enable && corepack prepare pnpm@latest --activate
+
 WORKDIR /app
 
-# Copy package files first (Docker layer cache)
-COPY package.json package-lock.json* ./
+# Copy lockfile first (Docker layer cache)
+COPY package.json pnpm-lock.yaml ./
 
 # Install ALL deps (including devDeps for tsc)
-RUN npm ci
+RUN pnpm install --frozen-lockfile
 
 # Copy source and build
 COPY tsconfig.json ./
 COPY src/ ./src/
 
-RUN npm run build
+RUN pnpm run build
 
 # ── Stage 2: Production ──────────────────────────────────────
 FROM node:22-alpine AS production
+
+# Enable pnpm
+RUN corepack enable && corepack prepare pnpm@latest --activate
 
 # Non-root user for security
 RUN addgroup -g 1001 -S sage && \
@@ -34,9 +40,9 @@ RUN addgroup -g 1001 -S sage && \
 
 WORKDIR /app
 
-# Copy package files and install production deps only
-COPY package.json package-lock.json* ./
-RUN npm ci --omit=dev && npm cache clean --force
+# Copy lockfile and install production deps only
+COPY package.json pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile --prod && pnpm store prune
 
 # Copy compiled JS from builder
 COPY --from=builder /app/dist ./dist
