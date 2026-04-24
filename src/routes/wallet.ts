@@ -29,6 +29,17 @@ import config from "../config.js";
 import db from "../db/index.js";
 import { bots } from "../db/schema.js";
 import { eq, and } from "drizzle-orm";
+import {
+  getTokenInfos,
+  swapToSOL,
+  jupiterEnabled,
+  SOL_MINT,
+  type JupiterTokenInfo,
+  type SwapResult,
+} from "../services/jupiter.js";
+import { logger } from "../middleware/logger.js";
+
+const walletLog = logger.child({ component: "wallet" });
 
 const wallet = new Hono<{ Variables: AuthVariables }>();
 
@@ -494,6 +505,336 @@ wallet.post(
       totalWithdrawnSOL: totalWithdrawn,
       results,
     });
+  }
+);
+
+
+// ═══════════════════════════════════════════════════════════════
+// GET /wallet/portfolio/:botId — Smart Wallet view
+// Returns SOL + EVERY SPL token in the bot wallet, enriched with USD
+// price + metadata via Jupiter Token API. This is what the new mobile
+// Smart Wallet panel renders.
+// ═══════════════════════════════════════════════════════════════
+
+interface PortfolioToken {
+  mint: string;
+  symbol: string;
+  name: string;
+  icon: string | null;
+  decimals: number;
+  amount: number;          // ui amount (already / 10^decimals)
+  rawAmount: string;       // smallest unit, string to preserve precision
+  usdPrice: number | null; // null when Jupiter has no price
+  usdValue: number;        // amount * usdPrice (0 if price unknown)
+  isVerified: boolean;
+  swappable: boolean;      // we can sweep this to SOL via Jupiter
+}
+
+interface PortfolioResponse {
+  botId: string;
+  walletAddress: string;
+  ownerWallet: string | null;
+  sol: { amount: number; rawLamports: number; usdPrice: number | null; usdValue: number };
+  tokens: PortfolioToken[];
+  totalUsdValue: number;
+  jupiterEnabled: boolean;
+}
+
+wallet.get("/portfolio/:botId", requireAuth, async (c) => {
+  const userId = c.var.userId;
+  const botId = c.req.param("botId");
+  validateBotId(botId);
+
+  const bot = await getLiveBot(userId, botId);
+  const connection = getConnection();
+  const pubkey = new PublicKey(bot.walletAddress!);
+
+  // Fetch SOL + token accounts in parallel.
+  const [solLamports, tokenAccounts] = await Promise.all([
+    connection.getBalance(pubkey),
+    connection.getParsedTokenAccountsByOwner(pubkey, { programId: TOKEN_PROGRAM_ID }),
+  ]);
+
+  const rawTokens: { mint: string; rawAmount: string; amount: number; decimals: number }[] = [];
+  for (const { account } of tokenAccounts.value) {
+    const parsed = account.data.parsed?.info;
+    if (!parsed) continue;
+    const mint = parsed.mint as string;
+    const amountStr = (parsed.tokenAmount?.amount as string) ?? "0";
+    const uiAmount = (parsed.tokenAmount?.uiAmount as number) ?? 0;
+    const decimals = (parsed.tokenAmount?.decimals as number) ?? 0;
+    if (uiAmount > 0) {
+      rawTokens.push({
+        mint,
+        rawAmount: amountStr,
+        amount: uiAmount,
+        decimals,
+      });
+    }
+  }
+
+  // Always include SOL mint in the lookup so we can price the native balance.
+  const mintsToLookup = Array.from(
+    new Set([SOL_MINT, ...rawTokens.map((t) => t.mint)])
+  );
+  const infos = await getTokenInfos(mintsToLookup);
+
+  const solInfo = infos.get(SOL_MINT);
+  const solUsdPrice = solInfo?.usdPrice ?? null;
+  const solAmount = solLamports / LAMPORTS_PER_SOL;
+
+  const tokens: PortfolioToken[] = rawTokens.map((t) => {
+    const info: JupiterTokenInfo | undefined = infos.get(t.mint);
+    const usdPrice = info?.usdPrice ?? null;
+    const usdValue = usdPrice != null ? t.amount * usdPrice : 0;
+    return {
+      mint: t.mint,
+      symbol: info?.symbol ?? t.mint.slice(0, 4) + "…",
+      name: info?.name ?? "Unknown token",
+      icon: info?.icon ?? null,
+      decimals: t.decimals,
+      amount: t.amount,
+      rawAmount: t.rawAmount,
+      usdPrice,
+      usdValue,
+      isVerified: info?.isVerified ?? false,
+      // Only attempt to sweep tokens Jupiter knows about with a price + decent
+      // liquidity. Avoids pumping garbage / honeypots through swap routes.
+      swappable:
+        info != null &&
+        info.usdPrice != null &&
+        (info.liquidity ?? 0) > 1_000,
+    };
+  });
+
+  // Sort by USD value desc so the wallet sees their biggest bag first.
+  tokens.sort((a, b) => b.usdValue - a.usdValue);
+
+  const solUsdValue = solUsdPrice != null ? solAmount * solUsdPrice : 0;
+  const totalUsdValue =
+    solUsdValue + tokens.reduce((sum, t) => sum + t.usdValue, 0);
+
+  const body: PortfolioResponse = {
+    botId,
+    walletAddress: bot.walletAddress!,
+    ownerWallet: bot.ownerWallet ?? null,
+    sol: {
+      amount: solAmount,
+      rawLamports: solLamports,
+      usdPrice: solUsdPrice,
+      usdValue: solUsdValue,
+    },
+    tokens,
+    totalUsdValue,
+    jupiterEnabled: jupiterEnabled(),
+  };
+  return c.json(body);
+});
+
+
+// ═══════════════════════════════════════════════════════════════
+// POST /wallet/sweep/:botId — sweep all SPL tokens to SOL via Jupiter
+//
+// For every swappable token in the bot wallet:
+//   1. Quote a swap to SOL (full balance, RTSE slippage)
+//   2. Sign with the bot keypair
+//   3. /execute via Jupiter (managed landing)
+// Then optionally drain the resulting SOL to the owner wallet.
+//
+// Response includes per-token results so the UI can show "swapped 8.04 USDC
+// → 0.052 SOL via dflow" etc. Failures are reported per-token, not fatal.
+//
+// Security: same ownership check as /withdraw — destination is locked to
+// the bot's registered ownerWallet. Caller cannot redirect funds.
+// ═══════════════════════════════════════════════════════════════
+
+const sweepSchema = z.object({
+  /** When true, transfer the resulting SOL (minus base fee) to ownerWallet after swaps. */
+  withdrawAfter: z.boolean().default(true),
+  /** Override slippage in bps; omit to let Jupiter use RTSE. */
+  slippageBps: z.number().int().min(1).max(10_000).optional(),
+  /** Optional: only sweep these mints. Default = all swappable tokens. */
+  mints: z.array(z.string().min(32).max(64)).optional(),
+});
+
+wallet.post(
+  "/sweep/:botId",
+  requireAuth,
+  zValidator("json", sweepSchema),
+  async (c) => {
+    if (!jupiterEnabled()) {
+      throw createApiError(
+        "Smart Wallet sweep is not configured on this server (JUPITER_API_KEY missing).",
+        503
+      );
+    }
+
+    const userId = c.var.userId;
+    const botId = c.req.param("botId");
+    validateBotId(botId);
+
+    const bot = await getLiveBot(userId, botId);
+    const { withdrawAfter, slippageBps, mints: mintsFilter } = c.req.valid("json");
+
+    if (withdrawAfter && !bot.ownerWallet) {
+      throw createApiError("Owner wallet not set — cannot withdraw after sweep.", 400);
+    }
+
+    const connection = getConnection();
+    const botPubkey = new PublicKey(bot.walletAddress!);
+
+    // 1. Discover swappable tokens.
+    const tokenAccounts = await connection.getParsedTokenAccountsByOwner(
+      botPubkey,
+      { programId: TOKEN_PROGRAM_ID }
+    );
+
+    type Holding = { mint: string; rawAmount: string; uiAmount: number; decimals: number };
+    const holdings: Holding[] = [];
+    for (const { account } of tokenAccounts.value) {
+      const parsed = account.data.parsed?.info;
+      if (!parsed) continue;
+      const mint = parsed.mint as string;
+      const rawAmount = (parsed.tokenAmount?.amount as string) ?? "0";
+      const uiAmount = (parsed.tokenAmount?.uiAmount as number) ?? 0;
+      const decimals = (parsed.tokenAmount?.decimals as number) ?? 0;
+      if (uiAmount > 0 && rawAmount !== "0") {
+        if (mintsFilter && !mintsFilter.includes(mint)) continue;
+        holdings.push({ mint, rawAmount, uiAmount, decimals });
+      }
+    }
+
+    // 2. Look up Jupiter price + liquidity to filter to swappable tokens.
+    const infos = await getTokenInfos(holdings.map((h) => h.mint));
+    const swappable = holdings.filter((h) => {
+      const info = infos.get(h.mint);
+      return info != null && info.usdPrice != null && (info.liquidity ?? 0) > 1_000;
+    });
+    const skipped = holdings.filter((h) => !swappable.includes(h));
+
+    // 3. Decrypt the bot keypair ONCE for all swaps + final transfer.
+    const keypair = decryptKeypair(
+      bot.encryptedPrivateKey!,
+      config.MASTER_ENCRYPTION_KEY
+    );
+
+    type SwapOutcome = {
+      mint: string;
+      symbol: string;
+      uiAmount: number;
+      success: boolean;
+      signature?: string;
+      receivedSOL?: number;
+      router?: string;
+      error?: string;
+    };
+    const outcomes: SwapOutcome[] = [];
+    let totalSwappedSOL = 0;
+
+    try {
+      // Swaps are sequential — Jupiter's /execute rate-limit bucket is small
+      // (50 RPS even on Free tier) and serializing also keeps RPC pressure low.
+      for (const h of swappable) {
+        const info = infos.get(h.mint);
+        const symbol = info?.symbol ?? h.mint.slice(0, 4);
+        try {
+          const result: SwapResult = await swapToSOL(
+            connection,
+            keypair,
+            h.mint,
+            h.rawAmount,
+            slippageBps
+          );
+          totalSwappedSOL += result.outputSOL;
+          outcomes.push({
+            mint: h.mint,
+            symbol,
+            uiAmount: h.uiAmount,
+            success: true,
+            signature: result.signature,
+            receivedSOL: result.outputSOL,
+            router: result.router,
+          });
+          walletLog.info(
+            { botId, mint: h.mint, sol: result.outputSOL, sig: result.signature },
+            "sweep swap landed"
+          );
+        } catch (e: any) {
+          outcomes.push({
+            mint: h.mint,
+            symbol,
+            uiAmount: h.uiAmount,
+            success: false,
+            error: e?.message ?? "swap failed",
+          });
+          walletLog.warn(
+            { botId, mint: h.mint, err: e?.message },
+            "sweep swap failed"
+          );
+        }
+      }
+
+      // Skipped tokens — surface to UI so users know we left them alone.
+      for (const h of skipped) {
+        const info = infos.get(h.mint);
+        outcomes.push({
+          mint: h.mint,
+          symbol: info?.symbol ?? h.mint.slice(0, 4),
+          uiAmount: h.uiAmount,
+          success: false,
+          error:
+            info == null
+              ? "Not indexed by Jupiter"
+              : info.usdPrice == null
+                ? "No USD price"
+                : "Insufficient liquidity to swap safely",
+        });
+      }
+
+      // 4. Optionally drain SOL to owner wallet.
+      let withdrawSig: string | null = null;
+      let withdrawnSOL = 0;
+      if (withdrawAfter) {
+        const ownerPubkey = new PublicKey(bot.ownerWallet!);
+        const balance = await connection.getBalance(botPubkey);
+        const BASE_FEE = 5_000;
+        if (balance > BASE_FEE) {
+          const withdrawLamports = balance - BASE_FEE;
+          const tx = new Transaction().add(
+            SystemProgram.transfer({
+              fromPubkey: botPubkey,
+              toPubkey: ownerPubkey,
+              lamports: withdrawLamports,
+            })
+          );
+          const txSender = new TransactionSender(connection);
+          // Drain → no priority fee, account → 0 lamports.
+          const sendResult = await txSender.sendTransaction(tx, [keypair]);
+          if (sendResult.success) {
+            withdrawSig = sendResult.signature ?? null;
+            withdrawnSOL = withdrawLamports / LAMPORTS_PER_SOL;
+          } else {
+            walletLog.warn(
+              { botId, err: sendResult.error },
+              "sweep final withdraw failed (swaps already landed)"
+            );
+          }
+        }
+      }
+
+      return c.json({
+        success: true,
+        botId,
+        swappedTokenCount: outcomes.filter((o) => o.success).length,
+        totalSwappedSOL,
+        withdraw: withdrawAfter
+          ? { signature: withdrawSig, amountSOL: withdrawnSOL, to: bot.ownerWallet }
+          : null,
+        outcomes,
+      });
+    } finally {
+      keypair.secretKey.fill(0);
+    }
   }
 );
 

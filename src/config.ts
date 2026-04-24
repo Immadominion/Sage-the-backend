@@ -39,6 +39,17 @@ const envSchema = z.object({
   ),
   CORS_ORIGINS: z.string().default("*"),
   HELIUS_API_KEY: z.string().optional(),
+  /**
+   * Jupiter Developer Platform API key (https://developers.jup.ag/portal).
+   * Powers the Smart Wallet feature: token metadata, USD prices, and
+   * swap-to-SOL routing for the /wallet/sweep endpoint. When unset, the
+   * portfolio endpoint still works (returns raw mints with no USD value)
+   * but /wallet/sweep returns 503.
+   */
+  JUPITER_API_KEY: z
+    .string()
+    .optional()
+    .describe("Jupiter Developer Platform API key (x-api-key header)"),
   METEORA_API_URL: z
     .string()
     .url()
