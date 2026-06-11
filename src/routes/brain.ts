@@ -66,7 +66,24 @@ async function runAnalysis(
       .where(eq(brains.brainId, brainId));
     emit("brain:progress", { brainId, status: "fetching" });
 
-    const r = await walletIntel.analyzeWallet(wallet, windowDays, maxTxs);
+    // Async job: start it, then poll short fast requests until done. This
+    // avoids holding one long HTTP connection (which the gateway cuts at ~60s).
+    const jobId = await walletIntel.startAnalyze(wallet, windowDays, maxTxs);
+    const deadlineMs = Date.now() + 9 * 60_000; // hard ceiling
+    let r: walletIntel.WalletIntelResult | null = null;
+    while (Date.now() < deadlineMs) {
+      await new Promise((res) => setTimeout(res, 4000));
+      const job = await walletIntel.getAnalyzeResult(jobId);
+      if (job.status === "complete") {
+        r = job.result;
+        break;
+      }
+      if (job.status === "error") {
+        throw new Error(job.error || "analysis failed");
+      }
+      // still running → keep polling
+    }
+    if (!r) throw new Error("analysis timed out");
     const fp = (r.fingerprint ?? {}) as Record<string, any>;
     const ev = (fp.evidence ?? {}) as Record<string, number>;
 
