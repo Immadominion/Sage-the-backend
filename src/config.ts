@@ -164,6 +164,17 @@ const envSchema = z.object({
    * Set to -1 to disable the digest cron entirely.
    */
   DIGEST_HOUR_UTC: z.coerce.number().int().min(-1).max(23).default(21),
+
+  // ── Wallet Intelligence service ──────────────────────
+  WALLET_INTEL_URL: z
+    .string()
+    .url()
+    .optional()
+    .describe("Base URL of the wallet-intelligence FastAPI service (e.g. http://localhost:8200)"),
+  WALLET_INTEL_API_KEY: z
+    .string()
+    .optional()
+    .describe("Shared secret sent as X-WI-API-Key to the wallet-intelligence service"),
 });
 
 const parsed = envSchema.safeParse(process.env);

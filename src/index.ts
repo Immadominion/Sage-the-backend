@@ -51,6 +51,7 @@ import aiRoutes from "./routes/ai.js";
 import fleetRoutes from "./routes/fleet.js";
 import analyticsRoutes from "./routes/analytics.js";
 import lpAgentRoutes from "./routes/lp-agent.js";
+import brainRoutes from "./routes/brain.js";
 process.stdout.write(`[boot] route imports complete\n`);
 
 // Engine
@@ -167,6 +168,9 @@ app.use("/analytics/*", readRateLimit);
 app.use("/bot/list", readRateLimit);
 app.use("/wallet/*", readRateLimit);
 app.use("/lp-agent/*", externalApiRateLimit);
+// Wallet-intelligence analysis is expensive (RPC-heavy) — gate it like bot lifecycle.
+app.use("/brain/analyze", botLifecycleRateLimit);
+app.use("/brain/list", readRateLimit);
 
 // ── Routes ──
 app.route("/health", healthRoutes);
@@ -181,6 +185,7 @@ app.route("/ai", aiRoutes);
 app.route("/fleet", fleetRoutes);
 app.route("/analytics", analyticsRoutes);
 app.route("/lp-agent", lpAgentRoutes);
+app.route("/brain", brainRoutes);
 
 // ── 404 ──
 app.notFound((c) => c.json({

@@ -78,6 +78,8 @@ class EventBus {
       "engine:stopped",
       "engine:error",
       "stats:updated",
+      "brain:progress",
+      "brain:completed",
     ];
 
     const wrapper = (event: BotEvent) => {
@@ -115,6 +117,8 @@ class EventBus {
       "engine:stopped",
       "engine:error",
       "stats:updated",
+      "brain:progress",
+      "brain:completed",
     ];
 
     const wrapper = (event: BotEvent) => {

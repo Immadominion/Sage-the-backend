@@ -578,3 +578,75 @@ export const feeLedger = pgTable(
     index("fee_ledger_created_at_idx").on(table.createdAt),
   ]
 );
+
+// ═══════════════════════════════════════════════════════════════
+// Brains (Wallet Intelligence — analysis runs)
+// ═══════════════════════════════════════════════════════════════
+//
+// A "brain" is an analysis of a real wallet's on-chain trading: the backend
+// fetches the wallet's full history, the wallet-intelligence service decodes it
+// and reconstructs real DLMM positions (real PnL) + swaps, and the resulting
+// behavioral fingerprint is stored here. One row per analysis run.
+//
+// Analysis is async (seconds-to-minutes): the row is created `queued` and the
+// in-process worker advances status → fetching → decoding → reconstructing →
+// complete (or error). The client polls GET /brain/:brainId.
+
+export const brains = pgTable(
+  "brains",
+  {
+    id: serial("id").primaryKey(),
+    /** Short unique ID for API use (8-char hex) — uniqueness via brains_brain_id_idx */
+    brainId: text("brain_id").notNull(),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id),
+    /** The wallet being analyzed (NOT the user's auth wallet) */
+    walletAddress: text("wallet_address").notNull(),
+
+    /** Analysis lifecycle status */
+    status: text("status", {
+      enum: ["queued", "fetching", "decoding", "reconstructing", "complete", "error"],
+    })
+      .notNull()
+      .default("queued"),
+
+    // ── Request params ──
+    windowDays: integer("window_days").notNull().default(90),
+    maxTxs: integer("max_txs").notNull().default(5000),
+
+    // ── Evidence counts (filled as analysis progresses) ──
+    txsScanned: integer("txs_scanned"),
+    positionsTotal: integer("positions_total"),
+    positionsComplete: integer("positions_complete"),
+    swapsFound: integer("swaps_found"),
+    poolsResolved: integer("pools_resolved"),
+    /** high | medium | low — derived from evidence volume */
+    confidence: text("confidence"),
+
+    // ── Results (JSON) ──
+    /** Full behavioral fingerprint (aura.wallet_fingerprint.v1) */
+    fingerprint: jsonb("fingerprint"),
+    /** PnL summary (win rate, profit factor, avg pnl/alpha, median hold) */
+    pnlSummary: jsonb("pnl_summary"),
+    /** Top priced positions for transparency / Solscan reconciliation */
+    pricedPositions: jsonb("priced_positions"),
+
+    /** Error message if status = error */
+    error: text("error"),
+
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+  },
+  (table) => [
+    uniqueIndex("brains_brain_id_idx").on(table.brainId),
+    index("brains_user_id_idx").on(table.userId),
+    index("brains_wallet_address_idx").on(table.walletAddress),
+    index("brains_status_idx").on(table.status),
+  ]
+);

@@ -425,7 +425,10 @@ export type BotEventType =
   | "engine:stopped"
   | "engine:error"
   | "engine:warning"
-  | "stats:updated";
+  | "stats:updated"
+  // Wallet Intelligence (brain analysis) progress — streamed over the same SSE.
+  | "brain:progress"
+  | "brain:completed";
 
 export interface BotEvent {
   type: BotEventType;
