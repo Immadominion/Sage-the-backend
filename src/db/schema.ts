@@ -635,6 +635,9 @@ export const brains = pgTable(
     /** Error message if status = error */
     error: text("error"),
 
+    /** Linked bot once the brain has been deployed (null until then). */
+    botId: text("bot_id"),
+
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),

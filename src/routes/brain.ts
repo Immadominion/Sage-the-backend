@@ -16,10 +16,10 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
 import crypto from "node:crypto";
-import { eq, and, desc } from "drizzle-orm";
+import { eq, and, desc, sql, isNull } from "drizzle-orm";
 import { createApiError } from "../middleware/error.js";
 import db from "../db/index.js";
-import { brains } from "../db/schema.js";
+import { brains, bots, tradeLog } from "../db/schema.js";
 import { requireAuth, type AuthVariables } from "../middleware/auth.js";
 import { eventBus } from "../engine/event-bus.js";
 import { logger } from "../middleware/logger.js";
@@ -153,6 +153,162 @@ brain.get("/:brainId", async (c) => {
     .where(and(eq(brains.brainId, brainId), eq(brains.userId, userId)));
   if (!row) throw createApiError("Brain not found", 404);
   return c.json({ brain: row });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// POST /brain/:brainId/deploy — compile fingerprint → bot config → create bot
+// ═══════════════════════════════════════════════════════════════
+
+const deploySchema = z.object({
+  // v1 deploys as simulation (paper trade); convert-to-live is a separate flow.
+  mode: z.enum(["simulation", "live"]).default("simulation"),
+  fundingSOL: z.number().positive().max(1000).optional(),
+});
+
+const _clamp = (v: number, lo: number, hi: number) =>
+  Math.min(hi, Math.max(lo, v));
+const _r1 = (v: number) => Math.round(v * 10) / 10;
+const _num = (v: unknown, fallback: number) =>
+  typeof v === "number" && Number.isFinite(v) ? v : fallback;
+
+/**
+ * Inverse strategy inference: derive a rule-based bot config from a wallet's
+ * behavioral fingerprint. Sizing is scaled to the user's bankroll and a
+ * protective stop-loss is INJECTED regardless of source behavior. All values
+ * are clamped for capital coherence (mirrors createBotSchema's clamps).
+ */
+function compileBrainConfig(
+  fingerprint: Record<string, any>,
+  pnlSummary: Record<string, any> | null,
+  bankrollSOL: number
+) {
+  const lp = (fingerprint?.lp_behavior ?? {}) as Record<string, any>;
+  const holdMedianH = _num(lp?.hold_hours?.median, 4);
+  const sizeMedianSol = _num(lp?.position_size_y?.median, 0.5);
+  const concurrency = _num(lp?.max_concurrency, 3);
+  const avgPnl = _num(pnlSummary?.avg_pnl_ratio, 0.1);
+
+  let positionSizeSOL = _clamp(_r1(sizeMedianSol), 0.1, _r1(bankrollSOL * 0.4));
+  let maxConcurrentPositions = Math.round(_clamp(concurrency, 1, 8));
+  // Exposure clamp: positionSize × concurrency ≤ 2× bankroll.
+  if (positionSizeSOL * maxConcurrentPositions > bankrollSOL * 2) {
+    maxConcurrentPositions = Math.max(
+      1,
+      Math.floor((bankrollSOL * 2) / positionSizeSOL)
+    );
+  }
+  const maxHoldTimeMinutes = Math.round(_clamp(holdMedianH * 60, 30, 1440));
+  const profitTargetPercent = _clamp(_r1(Math.abs(avgPnl) * 100) || 10, 4, 40);
+  const stopLossPercent = 12; // injected — the brain adds a stop the wallet lacked
+  const maxDailyLossSOL = Math.min(bankrollSOL, _r1(positionSizeSOL * 2));
+
+  return {
+    entryScoreThreshold: 150,
+    minVolume24h: 1000,
+    minLiquidity: 100,
+    maxLiquidity: 1_000_000,
+    positionSizeSOL,
+    maxConcurrentPositions,
+    defaultBinRange: 10,
+    profitTargetPercent,
+    stopLossPercent,
+    maxHoldTimeMinutes,
+    maxDailyLossSOL,
+    cooldownMinutes: 60,
+    cronIntervalSeconds: 30,
+  };
+}
+
+function _shortWallet(w: string): string {
+  return w.length > 8 ? `${w.slice(0, 4)}…${w.slice(-4)}` : w;
+}
+
+brain.post("/:brainId/deploy", zValidator("json", deploySchema), async (c) => {
+  const userId = c.var.userId;
+  const brainId = c.req.param("brainId");
+  const { fundingSOL } = c.req.valid("json");
+
+  const [row] = await db
+    .select()
+    .from(brains)
+    .where(and(eq(brains.brainId, brainId), eq(brains.userId, userId)));
+  if (!row) throw createApiError("Brain not found", 404);
+
+  // Idempotent: if already deployed, return the existing bot.
+  if (row.botId) {
+    const [existing] = await db
+      .select()
+      .from(bots)
+      .where(and(eq(bots.botId, row.botId), eq(bots.userId, userId)));
+    if (existing) {
+      const { encryptedPrivateKey: _e, ...safe } = existing;
+      return c.json({ bot: safe });
+    }
+  }
+
+  if (row.status !== "complete") {
+    throw createApiError("Brain analysis is not complete yet", 400);
+  }
+  const fingerprint = row.fingerprint as Record<string, any> | null;
+  if (!fingerprint) {
+    throw createApiError("Brain has no fingerprint to deploy", 400);
+  }
+
+  // Per-user bot cap (exclude soft-deleted).
+  const [existingBots] = await db
+    .select({ count: sql<number>`count(*)` })
+    .from(bots)
+    .where(and(eq(bots.userId, userId), isNull(bots.deletedAt)));
+  if ((existingBots?.count ?? 0) >= 10) {
+    throw createApiError("Maximum 10 bots per user", 400);
+  }
+
+  // v1: always deploy as a simulation (paper) bot; convert-to-live later.
+  const bankrollSOL = fundingSOL ?? 10;
+  const cfg = compileBrainConfig(
+    fingerprint,
+    row.pnlSummary as Record<string, any> | null,
+    bankrollSOL
+  );
+
+  const botId = generateBrainId(); // 8-char hex, same format as botId
+  const name = `Brain · ${_shortWallet(row.walletAddress)}`;
+
+  await db.insert(bots).values({
+    botId,
+    userId,
+    name,
+    mode: "simulation",
+    strategyMode: "rule-based",
+    simulationBalanceSOL: bankrollSOL,
+    ...cfg,
+  });
+
+  await db.insert(tradeLog).values({
+    botId,
+    userId,
+    event: "bot_started",
+    details: JSON.stringify({
+      action: "deployed_from_brain",
+      brainId,
+      sourceWallet: row.walletAddress,
+      config: cfg,
+    }),
+  });
+
+  await db
+    .update(brains)
+    .set({ botId, updatedAt: new Date() })
+    .where(eq(brains.brainId, brainId));
+
+  const [created] = await db
+    .select()
+    .from(bots)
+    .where(and(eq(bots.botId, botId), eq(bots.userId, userId)));
+  const { encryptedPrivateKey: _e, ...safe } = created ?? {};
+
+  log.info({ brainId, botId, sourceWallet: row.walletAddress }, "brain deployed → bot");
+  return c.json({ bot: safe }, 201);
 });
 
 export default brain;
