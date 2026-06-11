@@ -35,8 +35,10 @@ const BASE58_ADDRESS = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
 const analyzeSchema = z.object({
   wallet: z.string().regex(BASE58_ADDRESS, "invalid Solana wallet address"),
-  windowDays: z.number().int().min(1).max(365).default(90),
-  maxTxs: z.number().int().min(100).max(20_000).default(5_000),
+  // Defaults kept modest so a single synchronous analysis finishes well under
+  // the gateway/request timeout. Deeper history needs the async job refactor.
+  windowDays: z.number().int().min(1).max(365).default(30),
+  maxTxs: z.number().int().min(100).max(20_000).default(1_500),
 });
 
 function generateBrainId(): string {
