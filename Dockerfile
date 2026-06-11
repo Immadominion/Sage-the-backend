@@ -12,7 +12,7 @@
 FROM node:22-alpine AS builder
 
 # Enable pnpm via corepack (project's source-of-truth lock file is pnpm-lock.yaml)
-RUN corepack enable && corepack prepare pnpm@latest --activate
+RUN corepack enable && corepack prepare pnpm@9.15.9 --activate
 
 WORKDIR /app
 
@@ -32,7 +32,7 @@ RUN pnpm run build
 FROM node:22-alpine AS production
 
 # Enable pnpm
-RUN corepack enable && corepack prepare pnpm@latest --activate
+RUN corepack enable && corepack prepare pnpm@9.15.9 --activate
 
 # Non-root user for security
 RUN addgroup -g 1001 -S sage && \
